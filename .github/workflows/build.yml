@@ -29,6 +29,7 @@ jobs:
           ls -la "$SDK_ROOT" "$SDK_ROOT/ndk" "$SDK_ROOT/platforms" 2>/dev/null || true
       - name: Build Fairy-Stockfish (arm64-v8a)
         run: |
+          set -e
           mkdir -p /tmp/checkers-eng app/src/main/jniLibs/arm64-v8a
           git clone --depth 1 https://github.com/fairy-stockfish/Fairy-Stockfish.git /tmp/checkers-eng/src
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
@@ -41,12 +42,20 @@ jobs:
             exit 1
           fi
           TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          make -C /tmp/checkers-eng/src -j"$(nproc)" \
-            build ARCH=armv8 COMP=clang \
+          MK_DIR="/tmp/checkers-eng/src"
+          if [ -f "$MK_DIR/src/Makefile" ]; then
+            MK_DIR="$MK_DIR/src"
+          fi
+          make -C "$MK_DIR" -j"$(nproc)" \
+            stockfish ARCH=armv8 COMP=clang \
             CXX="$TOOLCHAIN/aarch64-linux-android26-clang++" \
             LD="$TOOLCHAIN/aarch64-linux-android26-clang++" \
             STRIP="$TOOLCHAIN/llvm-strip"
-          cp /tmp/checkers-eng/src/stockfish app/src/main/jniLibs/arm64-v8a/libcheckers.so
+          BIN_PATH=$(find /tmp/checkers-eng/src -maxdepth 2 -type f -executable -name "stockfish*" | head -n 1)
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH="$MK_DIR/stockfish"
+          fi
+          cp "$BIN_PATH" app/src/main/jniLibs/arm64-v8a/libcheckers.so
           "$TOOLCHAIN/llvm-strip" app/src/main/jniLibs/arm64-v8a/libcheckers.so || true
           ls -lh app/src/main/jniLibs/arm64-v8a/libcheckers.so
       - name: Generate project
