@@ -16,18 +16,17 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - uses: android-actions/setup-android@v3
       - name: Install NDK and SDK packages
         run: |
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
           SDKM=$(find "$SDK_ROOT" -name "sdkmanager" -type f 2>/dev/null | head -n 1 || true)
           if [ -n "$SDKM" ]; then
             yes | "$SDKM" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
-            "$SDKM" --sdk_root="$SDK_ROOT" "ndk;27.0.12077973" "platforms;android-35" "build-tools;35.0.0"
-          else
-            echo "sdkmanager not found under $SDK_ROOT, checking existing SDK/NDK..."
-            ls -la "$SDK_ROOT" || true
+            "$SDKM" --sdk_root="$SDK_ROOT" "ndk;27.0.12077973" "platforms;android-35" "build-tools;35.0.0" || true
           fi
+          ls -la "$SDK_ROOT" "$SDK_ROOT/ndk" "$SDK_ROOT/platforms" 2>/dev/null || true
       - name: Build Fairy-Stockfish (arm64-v8a)
         run: |
           mkdir -p /tmp/checkers-eng app/src/main/jniLibs/arm64-v8a
@@ -126,9 +125,6 @@ jobs:
           cat > app/src/main/java/com/helper/checkers/DraughtsBoard.kt <<'EOF'
           package com.helper.checkers
 
-          // 0 = пусто
-          // 1 = белая шашка, 2 = белая дамка
-          // 3 = чёрная шашка, 4 = чёрная дамка
           data class MoveStep(val from: Int, val to: Int, val captures: List<Int> = emptyList())
 
           class DraughtsBoard(val size: Int = 8) {
