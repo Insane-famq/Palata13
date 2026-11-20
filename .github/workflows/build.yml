@@ -1,4 +1,4 @@
-name: Build Checkers APK
+name: Build APK
 on:
   push:
   workflow_dispatch:
@@ -16,48 +16,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Install NDK and SDK packages
-        run: |
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          export ANDROID_HOME="$SDK_ROOT"
-          export ANDROID_SDK_ROOT="$SDK_ROOT"
-          SDKM=$(find "$SDK_ROOT" -name "sdkmanager" -type f 2>/dev/null | head -n 1 || true)
-          if [ -n "$SDKM" ]; then
-            yes | "$SDKM" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
-            "$SDKM" --sdk_root="$SDK_ROOT" "ndk;27.0.12077973" "platforms;android-35" "build-tools;35.0.0" || true
-          fi
-          ls -la "$SDK_ROOT" "$SDK_ROOT/ndk" "$SDK_ROOT/platforms" 2>/dev/null || true
-      - name: Build Fairy-Stockfish (arm64-v8a)
-        run: |
-          set -e
-          mkdir -p /tmp/checkers-eng app/src/main/jniLibs/arm64-v8a
-          git clone --depth 1 https://github.com/fairy-stockfish/Fairy-Stockfish.git /tmp/checkers-eng/src
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          NDK_ROOT="${ANDROID_NDK_HOME:-}"
-          if [ -z "$NDK_ROOT" ] && [ -d "$SDK_ROOT/ndk" ]; then
-            NDK_ROOT=$(find "$SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1 || true)
-          fi
-          if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then
-            echo "NDK directory not found"
-            exit 1
-          fi
-          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          MK_DIR="/tmp/checkers-eng/src"
-          if [ -f "$MK_DIR/src/Makefile" ]; then
-            MK_DIR="$MK_DIR/src"
-          fi
-          make -C "$MK_DIR" -j"$(nproc)" \
-            stockfish ARCH=armv8 COMP=clang \
-            CXX="$TOOLCHAIN/aarch64-linux-android26-clang++" \
-            LD="$TOOLCHAIN/aarch64-linux-android26-clang++" \
-            STRIP="$TOOLCHAIN/llvm-strip"
-          BIN_PATH=$(find /tmp/checkers-eng/src -maxdepth 2 -type f -executable -name "stockfish*" | head -n 1)
-          if [ -z "$BIN_PATH" ]; then
-            BIN_PATH="$MK_DIR/stockfish"
-          fi
-          cp "$BIN_PATH" app/src/main/jniLibs/arm64-v8a/libcheckers.so
-          "$TOOLCHAIN/llvm-strip" app/src/main/jniLibs/arm64-v8a/libcheckers.so || true
-          ls -lh app/src/main/jniLibs/arm64-v8a/libcheckers.so
       - name: Generate project
         run: |
           mkdir -p app/src/main/java/com/helper/checkers
@@ -93,21 +51,15 @@ jobs:
                   targetSdk = 35
                   versionCode = 1
                   versionName = "1.0"
-                  ndk { abiFilters.add("arm64-v8a") }
+              }
+              buildTypes {
+                  getByName("debug") { isDebuggable = false }
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
               kotlinOptions { jvmTarget = "17" }
-              packaging {
-                  jniLibs {
-                      useLegacyPackaging = true
-                      keepDebugSymbols.add("**/*.so")
-                  }
-              }
-          }
-          dependencies {
           }
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
@@ -119,6 +71,7 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
               <application android:label="Шашечный помощник"
                   android:allowBackup="false"
+                  android:largeHeap="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
@@ -130,234 +83,6 @@ jobs:
                       android:foregroundServiceType="mediaProjection"/>
               </application>
           </manifest>
-          EOF
-          cat > app/src/main/java/com/helper/checkers/DraughtsBoard.kt <<'EOF'
-          package com.helper.checkers
-
-          data class MoveStep(val from: Int, val to: Int, val captures: List<Int> = emptyList())
-
-          class DraughtsBoard(val size: Int = 8) {
-              val cells = IntArray(size * size)
-              var whiteTurn: Boolean = true
-
-              init { reset() }
-
-              fun reset() {
-                  cells.fill(0)
-                  whiteTurn = true
-                  val rowsPerSide = if (size >= 10) 4 else 3
-                  for (r in 0 until size) {
-                      for (c in 0 until size) {
-                          if ((r + c) % 2 == 0) {
-                              if (r < rowsPerSide) cells[r * size + c] = 1
-                              else if (r >= size - rowsPerSide) cells[r * size + c] = 3
-                          }
-                      }
-                  }
-              }
-
-              fun copy(): DraughtsBoard {
-                  val b = DraughtsBoard(size)
-                  System.arraycopy(cells, 0, b.cells, 0, cells.size)
-                  b.whiteTurn = whiteTurn
-                  return b
-              }
-
-              private fun inBounds(r: Int, c: Int) = r in 0 until size && c in 0 until size
-              private fun idx(r: Int, c: Int) = r * size + c
-              private fun isWhite(p: Int) = p == 1 || p == 2
-              private fun isBlack(p: Int) = p == 3 || p == 4
-              private fun isKing(p: Int) = p == 2 || p == 4
-              private fun isOwn(p: Int, w: Boolean) = if (w) isWhite(p) else isBlack(p)
-              private fun isEnemy(p: Int, w: Boolean) = if (w) isBlack(p) else isWhite(p)
-              private fun promotionRow(w: Boolean) = if (w) size - 1 else 0
-              private fun promotePiece(piece: Int, row: Int, w: Boolean): Int {
-                  if (row != promotionRow(w)) return piece
-                  return when (piece) {
-                      1 -> 2
-                      3 -> 4
-                      else -> piece
-                  }
-              }
-
-              fun legalMoves(mandatoryCapture: Boolean = true): List<MoveStep> {
-                  val w = whiteTurn
-                  val captures = ArrayList<MoveStep>()
-                  val quiets = ArrayList<MoveStep>()
-                  val dirs = arrayOf(intArrayOf(1, 1), intArrayOf(1, -1), intArrayOf(-1, 1), intArrayOf(-1, -1))
-
-                  fun dfsCaptures(
-                      curPos: Int,
-                      piece: Int,
-                      visitedCaptured: Set<Int>,
-                      pathFrom: Int,
-                      accCaptures: MutableList<Int>,
-                      out: MutableList<MoveStep>
-                  ) {
-                      var extended = false
-                      val r0 = curPos / size
-                      val c0 = curPos % size
-                      val activePiece = promotePiece(piece, r0, w)
-                      val king = isKing(activePiece)
-
-                      for (d in dirs) {
-                          if (!king) {
-                              val r1 = r0 + d[0]
-                              val c1 = c0 + d[1]
-                              val r2 = r0 + 2 * d[0]
-                              val c2 = c0 + 2 * d[1]
-                              if (inBounds(r2, c2)) {
-                                  val mid = idx(r1, c1)
-                                  val dst = idx(r2, c2)
-                                  if (mid !in visitedCaptured && isEnemy(cells[mid], w) && cells[dst] == 0) {
-                                      extended = true
-                                      val nextVisited = visitedCaptured + mid
-                                      val nextCaps = ArrayList(accCaptures).apply { add(mid) }
-                                      val afterLandPiece = promotePiece(activePiece, r2, w)
-                                      dfsCaptures(dst, afterLandPiece, nextVisited, pathFrom, nextCaps, out)
-                                  }
-                              }
-                          } else {
-                              var step = 1
-                              while (true) {
-                                  val rm = r0 + step * d[0]
-                                  val cm = c0 + step * d[1]
-                                  if (!inBounds(rm, cm)) break
-                                  val mid = idx(rm, cm)
-                                  if (mid in visitedCaptured) {
-                                      step++
-                                      continue
-                                  }
-                                  val pm = cells[mid]
-                                  if (pm != 0) {
-                                      if (isOwn(pm, w)) break
-                                      var land = step + 1
-                                      while (true) {
-                                          val rl = r0 + land * d[0]
-                                          val cl = c0 + land * d[1]
-                                          if (!inBounds(rl, cl)) break
-                                          val dst = idx(rl, cl)
-                                          if (cells[dst] != 0) break
-                                          extended = true
-                                          val nextVisited = visitedCaptured + mid
-                                          val nextCaps = ArrayList(accCaptures).apply { add(mid) }
-                                          dfsCaptures(dst, activePiece, nextVisited, pathFrom, nextCaps, out)
-                                          land++
-                                      }
-                                      break
-                                  }
-                                  step++
-                              }
-                          }
-                      }
-
-                      if (!extended && accCaptures.isNotEmpty()) {
-                          out.add(MoveStep(pathFrom, curPos, accCaptures))
-                      }
-                  }
-
-                  for (i in cells.indices) {
-                      val p = cells[i]
-                      if (!isOwn(p, w)) continue
-                      dfsCaptures(i, p, emptySet(), i, ArrayList(), captures)
-                  }
-
-                  if (mandatoryCapture && captures.isNotEmpty()) {
-                      return captures
-                  }
-                  if (captures.isNotEmpty()) return captures
-
-                  for (i in cells.indices) {
-                      val p = cells[i]
-                      if (!isOwn(p, w)) continue
-                      val r0 = i / size
-                      val c0 = i % size
-                      if (!isKing(p)) {
-                          val dr = if (w) 1 else -1
-                          for (dc in intArrayOf(-1, 1)) {
-                              val r1 = r0 + dr
-                              val c1 = c0 + dc
-                              if (inBounds(r1, c1) && cells[idx(r1, c1)] == 0) {
-                                  quiets.add(MoveStep(i, idx(r1, c1)))
-                              }
-                          }
-                      } else {
-                          for (d in dirs) {
-                              var step = 1
-                              while (true) {
-                                  val r1 = r0 + step * d[0]
-                                  val c1 = c0 + step * d[1]
-                                  if (!inBounds(r1, c1)) break
-                                  if (cells[idx(r1, c1)] != 0) break
-                                  quiets.add(MoveStep(i, idx(r1, c1)))
-                                  step++
-                              }
-                          }
-                      }
-                  }
-                  return quiets
-              }
-
-              fun applyMove(m: MoveStep) {
-                  val p = cells[m.from]
-                  cells[m.from] = 0
-                  for (cap in m.captures) cells[cap] = 0
-                  val rTo = m.to / size
-                  val newP = promotePiece(p, rTo, whiteTurn)
-                  cells[m.to] = newP
-                  whiteTurn = !whiteTurn
-              }
-
-              fun coordName(i: Int): String {
-                  val file = ('a' + (i % size))
-                  val rank = (i / size) + 1
-                  return "$file$rank"
-              }
-
-              fun parseCoord(s: String): Int {
-                  if (s.length < 2) return -1
-                  val c = s[0].lowercaseChar() - 'a'
-                  val r = s.substring(1).toIntOrNull()?.minus(1) ?: return -1
-                  if (!inBounds(r, c)) return -1
-                  return idx(r, c)
-              }
-
-              fun uciToMove(uci: String, mandatoryCapture: Boolean = true): MoveStep? {
-                  if (uci.length < 4) return null
-                  val from = parseCoord(uci.substring(0, 2))
-                  val to = parseCoord(uci.substring(uci.length - 2))
-                  if (from < 0 || to < 0) return null
-                  val moves = legalMoves(mandatoryCapture)
-                  return moves.firstOrNull { it.from == from && it.to == to }
-                      ?: moves.firstOrNull { it.from == from }
-              }
-
-              fun toFen(): String {
-                  val sb = StringBuilder()
-                  for (r in size - 1 downTo 0) {
-                      var empty = 0
-                      for (c in 0 until size) {
-                          val ch = when (cells[r * size + c]) {
-                              1 -> 'P'
-                              2 -> 'K'
-                              3 -> 'p'
-                              4 -> 'k'
-                              else -> '.'
-                          }
-                          if (ch == '.') {
-                              empty++
-                          } else {
-                              if (empty > 0) { sb.append(empty); empty = 0 }
-                              sb.append(ch)
-                          }
-                      }
-                      if (empty > 0) sb.append(empty)
-                      if (r > 0) sb.append('/')
-                  }
-                  val turn = if (whiteTurn) "w" else "b"
-                  return "$sb $turn - - 0 1"
-              }
-          }
           EOF
           cat > app/src/main/java/com/helper/checkers/MainActivity.kt <<'EOF'
           package com.helper.checkers
@@ -403,14 +128,14 @@ jobs:
                   root.setPadding(56, 110, 56, 56)
 
                   val title = TextView(this)
-                  title.text = "⛂ Шашечный помощник"
+                  title.text = "⛀ Шашечный помощник"
                   title.textSize = 28f
                   title.setTextColor(Color.WHITE)
                   title.gravity = Gravity.CENTER
                   root.addView(title)
 
                   val sub = TextView(this)
-                  sub.text = "Подсказка ходов в реальном времени поверх доски"
+                  sub.text = "Свой движок в реальном времени: стрелка хода и оценка прямо поверх доски"
                   sub.textSize = 14f
                   sub.setTextColor(0xFF8B98A5.toInt())
                   sub.gravity = Gravity.CENTER
@@ -418,10 +143,11 @@ jobs:
                   root.addView(sub)
 
                   val steps = TextView(this)
-                  steps.text = "1. Открой приложение с шашками\n" +
-                      "2. Вернись сюда и нажми «Запустить»\n" +
-                      "3. Выдай доступ к экрану и оверлею\n" +
-                      "4. Доска найдётся сама; если нет — обведи её по краям"
+                  steps.text = "1. Открой приложение с шашками (можно с любого момента партии)\n" +
+                      "2. Вернись сюда, выбери правила и нажми «Запустить»\n" +
+                      "3. Дай доступ, доска и позиция определятся сами\n" +
+                      "4. Если доску не нашёл, обведи её по краям, рамка сама подстроится\n" +
+                      "5. Вид шашек и дамок запоминается сам (лучше начать с новой партии)"
                   steps.textSize = 15f
                   steps.setTextColor(0xFFD0D7DE.toInt())
                   steps.setLineSpacing(8f, 1f)
@@ -432,16 +158,36 @@ jobs:
                   steps.setPadding(40, 36, 40, 36)
                   root.addView(steps)
 
+                  val rl = TextView(this)
+                  rl.text = "Правила:"
+                  rl.textSize = 16f
+                  rl.setTextColor(Color.WHITE)
+                  rl.setPadding(0, 40, 0, 4)
+                  root.addView(rl)
+                  val rg = RadioGroup(this)
+                  val r0 = RadioButton(this)
+                  r0.text = "Русские шашки (дамка дальнобойная, бьют назад)"
+                  r0.setTextColor(Color.WHITE)
+                  r0.id = 1001
+                  val r1 = RadioButton(this)
+                  r1.text = "Английские / американские (checkers)"
+                  r1.setTextColor(Color.WHITE)
+                  r1.id = 1002
+                  rg.addView(r0); rg.addView(r1)
+                  rg.check(if (prefs.getInt("rules", 0) == 0) 1001 else 1002)
+                  rg.setOnCheckedChangeListener { _, id -> prefs.edit().putInt("rules", if (id == 1001) 0 else 1).apply() }
+                  root.addView(rg)
+
                   val tl = TextView(this)
                   tl.textSize = 16f
                   tl.setTextColor(Color.WHITE)
-                  tl.setPadding(0, 44, 0, 8)
+                  tl.setPadding(0, 32, 0, 8)
                   root.addView(tl)
                   val sb = SeekBar(this)
                   sb.max = 4
-                  val cur = prefs.getInt("ms", 3000)
+                  val cur = prefs.getInt("ms", 5000)
                   sb.progress = (cur / 1000 - 1).coerceIn(0, 4)
-                  fun upd(sec: Int) { tl.text = "Макс. время на ход: $sec с" }
+                  fun upd(sec: Int) { tl.text = "Макс. время на ход: $sec с\n(если ход очевиден, ответит быстрее)" }
                   upd(sb.progress + 1)
                   sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                       override fun onProgressChanged(x: SeekBar?, p: Int, u: Boolean) {
@@ -454,7 +200,7 @@ jobs:
                   root.addView(sb)
 
                   val both = CheckBox(this)
-                  both.text = "Подсказывать за обе стороны"
+                  both.text = "Подсказывать за обе стороны (разбор партии)"
                   both.setTextColor(Color.WHITE)
                   both.textSize = 15f
                   both.setPadding(0, 24, 0, 0)
@@ -465,7 +211,8 @@ jobs:
                   val go = btn("▶  Запустить", 0xFF2E9E5B.toInt())
                   val stop = btn("■  Остановить", 0xFFB23B3B.toInt())
                   val recal = btn("Указать доску вручную", 0xFF2A3440.toInt())
-                  root.addView(go); root.addView(stop); root.addView(recal)
+                  val reset = btn("Забыть вид шашек (сброс)", 0xFF2A3440.toInt())
+                  root.addView(go); root.addView(stop); root.addView(recal); root.addView(reset)
 
                   val sv = ScrollView(this)
                   sv.isFillViewport = true
@@ -492,6 +239,10 @@ jobs:
                       Toast.makeText(this, "Вернись в игру и обведи доску по краям", Toast.LENGTH_SHORT).show()
                       moveTaskToBack(true)
                   }
+                  reset.setOnClickListener {
+                      getSharedPreferences("t", Context.MODE_PRIVATE).edit().clear().apply()
+                      Toast.makeText(this, "Готово. Вид шашек запомнится заново", Toast.LENGTH_SHORT).show()
+                  }
               }
 
               @Deprecated("old api")
@@ -506,7 +257,389 @@ jobs:
               }
           }
           EOF
-          cat > app/src/main/java/com/helper/checkers/CaptureService.kt <<'EOF'
+          cat > app/src/main/java/com/helper/checkers/Engine.kt <<'EOF'
+          package com.helper.checkers
+
+          // Поле: 32 тёмные клетки. idx = rank*4 + file/2, rank 0 — сторона светлых.
+          // Фигуры: 0 пусто, 1 светлая шашка, 2 светлая дамка, 3 тёмная шашка, 4 тёмная дамка.
+          // Сторона: 0 светлые, 1 тёмные.
+
+          object Geo {
+              val NB = IntArray(128) { -1 }
+              private val DF = intArrayOf(1, -1, 1, -1)
+              private val DR = intArrayOf(1, 1, -1, -1)
+              fun file(i: Int) = 2 * (i % 4) + ((i / 4) % 2)
+              fun rank(i: Int) = i / 4
+              fun sq(f: Int, r: Int): Int = if (f !in 0..7 || r !in 0..7 || (f + r) % 2 != 0) -1 else r * 4 + f / 2
+              fun name(i: Int) = "" + ('a' + file(i)) + (rank(i) + 1)
+              init {
+                  for (i in 0..31) for (d in 0..3) NB[i * 4 + d] = sq(file(i) + DF[d], rank(i) + DR[d])
+              }
+          }
+
+          fun sideOf(p: Int) = if (p == 1 || p == 2) 0 else if (p == 3 || p == 4) 1 else -1
+          fun isKing(p: Int) = p == 2 || p == 4
+
+          class Move(
+              val from: Int, val to: Int, val path: IntArray,
+              val capSq: IntArray, val capPc: IntArray, val piece: Int, val promo: Boolean
+          ) {
+              val capMask: Int get() { var m = 0; for (s in capSq) m = m or (1 shl s); return m }
+              fun key(): Long = from.toLong() or (to.toLong() shl 5) or ((capMask.toLong() and 0xFFFFFFFFL) shl 10)
+          }
+
+          // russian = true: шашки бьют назад, дамки дальнобойные, превращение посреди боя с продолжением.
+          // russian = false (английские/американские): бьют только вперёд, дамка ходит на 1, превращение завершает ход.
+          class Pos(val russian: Boolean) {
+              val b = IntArray(32)
+              var side = 0
+              var hash = 0L
+
+              companion object {
+                  private val Z = Array(32) { LongArray(5) }
+                  private var ZS = 0L
+                  init {
+                      val r = java.util.Random(20261120)
+                      for (i in 0..31) for (p in 1..4) Z[i][p] = r.nextLong()
+                      ZS = r.nextLong()
+                  }
+              }
+
+              fun firstSide() = if (russian) 0 else 1
+
+              fun setStart() {
+                  for (i in 0..31) b[i] = if (i < 12) 1 else if (i >= 20) 3 else 0
+                  side = firstSide()
+                  rehash()
+              }
+
+              fun load(pcs: IntArray, s: Int) { for (i in 0..31) b[i] = pcs[i]; side = s; rehash() }
+
+              fun rehash() {
+                  var h = 0L
+                  for (i in 0..31) if (b[i] != 0) h = h xor Z[i][b[i]]
+                  if (side == 1) h = h xor ZS
+                  hash = h
+              }
+
+              fun copy(): Pos { val p = Pos(russian); p.load(b, side); return p }
+
+              private fun enemy(p: Int, s: Int) = p != 0 && sideOf(p) != s
+              private fun lastRank(s: Int) = if (s == 0) 7 else 0
+
+              // ---------- генерация ----------
+              fun moves(): ArrayList<Move> {
+                  if (hasCapture()) {
+                      val caps = ArrayList<Move>()
+                      for (i in 0..31) if (sideOf(b[i]) == side && canCap(i, b[i], 0, i)) genCaps(i, caps)
+                      return dedupe(caps)
+                  }
+                  val out = ArrayList<Move>()
+                  for (i in 0..31) {
+                      val p = b[i]
+                      if (sideOf(p) != side) continue
+                      if (isKing(p)) {
+                          for (d in 0..3) {
+                              var n = Geo.NB[i * 4 + d]
+                              while (n >= 0 && b[n] == 0) {
+                                  out.add(Move(i, n, intArrayOf(n), IntArray(0), IntArray(0), p, false))
+                                  if (!russian) break
+                                  n = Geo.NB[n * 4 + d]
+                              }
+                          }
+                      } else {
+                          val ds = if (side == 0) 0..1 else 2..3
+                          for (d in ds) {
+                              val n = Geo.NB[i * 4 + d]
+                              if (n >= 0 && b[n] == 0) out.add(Move(i, n, intArrayOf(n), IntArray(0), IntArray(0), p, Geo.rank(n) == lastRank(side)))
+                          }
+                      }
+                  }
+                  return out
+              }
+
+              fun hasCapture(): Boolean {
+                  for (i in 0..31) if (sideOf(b[i]) == side && canCap(i, b[i], 0, i)) return true
+                  return false
+              }
+
+              private fun dedupe(l: ArrayList<Move>): ArrayList<Move> {
+                  if (l.size < 2) return l
+                  val seen = HashSet<Long>()
+                  val o = ArrayList<Move>()
+                  for (m in l) if (seen.add(m.key())) o.add(m)
+                  return o
+              }
+
+              // клетки приземления после боя из pos в направлении d (пусто, если боя нет); второе значение — побитая клетка
+              private fun jumps(pos: Int, piece: Int, mask: Int, start: Int, d: Int, out: IntArray): Int {
+                  val s = sideOf(piece)
+                  val flying = isKing(piece) && russian
+                  if (!isKing(piece) && !russian) {
+                      if (s == 0 && d >= 2) return -1
+                      if (s == 1 && d < 2) return -1
+                  }
+                  var n = Geo.NB[pos * 4 + d]
+                  if (flying) while (n >= 0 && (b[n] == 0 || n == start)) n = Geo.NB[n * 4 + d]
+                  if (n < 0 || !enemy(b[n], s) || n == start || (mask shr n) and 1 == 1) return -1
+                  var l = Geo.NB[n * 4 + d]
+                  var k = 0
+                  while (l >= 0 && (b[l] == 0 || l == start)) {
+                      out[k++] = l
+                      if (!flying) break
+                      l = Geo.NB[l * 4 + d]
+                  }
+                  out[k] = -1
+                  return if (k == 0) -1 else n
+              }
+
+              private val ctmp = IntArray(9)
+              private fun canCap(pos: Int, piece: Int, mask: Int, start: Int): Boolean {
+                  for (d in 0..3) if (jumps(pos, piece, mask, start, d, ctmp) >= 0) return true
+                  return false
+              }
+
+              private fun genCaps(start: Int, out: ArrayList<Move>) {
+                  val p = b[start]
+                  rec(start, start, p, p, 0, IntArray(0), IntArray(0), out)
+              }
+
+              private fun promoted(piece: Int, sq: Int): Int {
+                  if (isKing(piece)) return piece
+                  val s = sideOf(piece)
+                  return if (Geo.rank(sq) == lastRank(s)) piece + 1 else piece
+              }
+
+              private fun rec(start: Int, pos: Int, orig: Int, piece: Int, mask: Int, path: IntArray, caps: IntArray, out: ArrayList<Move>) {
+                  val tmp = IntArray(9)
+                  for (d in 0..3) {
+                      val c = jumps(pos, piece, mask, start, d, tmp)
+                      if (c < 0) continue
+                      val ls = ArrayList<Int>()
+                      var k = 0
+                      while (tmp[k] >= 0) { ls.add(tmp[k]); k++ }
+                      val nm = mask or (1 shl c)
+                      val nc = caps + c
+                      val cont = ArrayList<Int>()
+                      for (l in ls) {
+                          val np = promoted(piece, l)
+                          val promoEnds = !russian && np != piece
+                          if (!promoEnds && canCap(l, np, nm, start)) cont.add(l)
+                      }
+                      val use = if (cont.isNotEmpty()) cont else ls
+                      for (l in use) {
+                          val np = promoted(piece, l)
+                          val npath = path + l
+                          if (cont.isNotEmpty()) rec(start, l, orig, np, nm, npath, nc, out)
+                          else out.add(Move(start, l, npath, nc, IntArray(nc.size) { b[nc[it]] }, orig, np != orig))
+                      }
+                  }
+              }
+
+              fun make(m: Move) {
+                  b[m.from] = 0
+                  hash = hash xor Z[m.from][m.piece]
+                  for (k in m.capSq.indices) { b[m.capSq[k]] = 0; hash = hash xor Z[m.capSq[k]][m.capPc[k]] }
+                  val np = if (m.promo) m.piece + 1 else m.piece
+                  b[m.to] = np
+                  hash = hash xor Z[m.to][np] xor ZS
+                  side = side xor 1
+              }
+
+              fun unmake(m: Move) {
+                  side = side xor 1
+                  val np = if (m.promo) m.piece + 1 else m.piece
+                  b[m.to] = 0
+                  hash = hash xor Z[m.to][np] xor ZS
+                  for (k in m.capSq.indices) { b[m.capSq[k]] = m.capPc[k]; hash = hash xor Z[m.capSq[k]][m.capPc[k]] }
+                  b[m.from] = m.piece
+                  hash = hash xor Z[m.from][m.piece]
+              }
+          }
+
+          // ---------- движок: альфа-бета, итеративное углубление, хэш-таблица, киллеры, история ----------
+          class Search {
+              private val TT_BITS = 20
+              private val TN = 1 shl TT_BITS
+              private val tKey = LongArray(TN)
+              private val tMove = LongArray(TN)
+              private val tInfo = IntArray(TN)
+              private val killers = LongArray(256)
+              private val hist = IntArray(32 * 32)
+              private val stack = LongArray(512)
+              private var deadline = 0L
+              private var nodes = 0L
+              private var abort = false
+              private val MATE = 30000
+
+              var score = 0
+              var depth = 0
+              var bestLine: Move? = null
+              fun nodeCount() = nodes
+
+              fun clear() {
+                  java.util.Arrays.fill(tKey, 0L); java.util.Arrays.fill(tInfo, 0)
+                  java.util.Arrays.fill(hist, 0)
+              }
+
+              // оценка с точки зрения стороны, которая ходит
+              private fun eval(p: Pos): Int {
+                  var s = 0
+                  var wm = 0; var wk = 0; var bm = 0; var bk = 0
+                  val kv = if (p.russian) 280 else 160
+                  for (i in 0..31) {
+                      val pc = p.b[i]
+                      if (pc == 0) continue
+                      val r = Geo.rank(i)
+                      val f = Geo.file(i)
+                      val center = if (f in 2..5 && r in 2..5) 6 else 0
+                      when (pc) {
+                          1 -> { wm++; s += 100 + r * r + center + (if (r == 0) 6 else 0) }
+                          3 -> { bm++; val rr = 7 - r; s -= 100 + rr * rr + center + (if (r == 7) 6 else 0) }
+                          2 -> { wk++; s += kv + (if (isMainDiag(i)) 12 else 0) }
+                          4 -> { bk++; s -= kv + (if (isMainDiag(i)) 12 else 0) }
+                      }
+                  }
+                  // при перевесе выгодно размениваться
+                  val wt = wm + wk; val bt = bm + bk
+                  if (wt != bt && wt + bt > 0) s += (if (s > 0) 1 else -1) * (24 - wt - bt) * 3
+                  if (wt == 0) s = -MATE / 2
+                  if (bt == 0) s = MATE / 2
+                  return if (p.side == 0) s else -s
+              }
+
+              private fun isMainDiag(i: Int) = Geo.file(i) == Geo.rank(i)
+
+              private fun ttIdx(h: Long) = (h ushr (64 - TT_BITS)).toInt()
+
+              private fun order(ms: ArrayList<Move>, ttm: Long, ply: Int) {
+                  val sc = IntArray(ms.size)
+                  for (k in ms.indices) {
+                      val m = ms[k]
+                      val key = m.key()
+                      sc[k] = when {
+                          key == ttm -> 1_000_000
+                          m.capSq.isNotEmpty() -> 100_000 + m.capSq.size * 1000 + (if (m.promo) 500 else 0)
+                          m.promo -> 90_000
+                          key == killers[ply] -> 80_000
+                          else -> hist[m.from * 32 + m.to]
+                      }
+                  }
+                  // вставками: списки короткие
+                  for (i in 1 until ms.size) {
+                      val m = ms[i]; val v = sc[i]
+                      var j = i - 1
+                      while (j >= 0 && sc[j] < v) { ms[j + 1] = ms[j]; sc[j + 1] = sc[j]; j-- }
+                      ms[j + 1] = m; sc[j + 1] = v
+                  }
+              }
+
+              private fun ab(p: Pos, d0: Int, a0: Int, beta: Int, ply: Int): Int {
+                  if ((++nodes and 2047L) == 0L && System.currentTimeMillis() > deadline) abort = true
+                  if (abort) return 0
+                  stack[ply] = p.hash
+                  // повторение позиции на пути = ничья
+                  var k = ply - 2
+                  while (k >= 0) { if (stack[k] == p.hash) return 0; k -= 2 }
+                  var d = d0
+                  var alpha = a0
+                  val ms = p.moves()
+                  if (ms.isEmpty()) return -MATE + ply
+                  val forcedCap = ms[0].capSq.isNotEmpty()
+                  if (d <= 0 && !forcedCap) return eval(p)
+                  if (d <= 0) d = 0 // бои досчитываем всегда
+                  if (ms.size == 1 && ply < 120) d++ // единственный ход — продлеваем
+                  if (ply >= 200) return eval(p)
+                  val idx = ttIdx(p.hash)
+                  var ttm = 0L
+                  if (tKey[idx] == p.hash) {
+                      ttm = tMove[idx]
+                      val info = tInfo[idx]
+                      val td = (info shr 2) and 255
+                      val ts = (info shr 10) - 40000
+                      val fl = info and 3
+                      if (td >= d && ply > 0) {
+                          if (fl == 0) return ts
+                          if (fl == 1 && ts >= beta) return ts
+                          if (fl == 2 && ts <= alpha) return ts
+                      }
+                  }
+                  order(ms, ttm, ply)
+                  var best = -MATE * 2
+                  var bm: Move? = null
+                  var first = true
+                  var n = 0
+                  for (m in ms) {
+                      p.make(m)
+                      var v: Int
+                      if (first) v = -ab(p, d - 1, -beta, -alpha, ply + 1)
+                      else {
+                          val red = if (!forcedCap && d >= 3 && n >= 3 && !m.promo && m.key() != killers[ply]) (if (n >= 8 && d >= 5) 2 else 1) else 0
+                          v = -ab(p, d - 1 - red, -alpha - 1, -alpha, ply + 1)
+                          if (red > 0 && v > alpha) v = -ab(p, d - 1, -alpha - 1, -alpha, ply + 1)
+                          if (v > alpha && v < beta) v = -ab(p, d - 1, -beta, -alpha, ply + 1)
+                      }
+                      p.unmake(m)
+                      if (abort) return 0
+                      first = false
+                      n++
+                      if (v > best) { best = v; bm = m }
+                      if (v > alpha) {
+                          alpha = v
+                          if (ply == 0) bestLine = m
+                      }
+                      if (alpha >= beta) {
+                          if (m.capSq.isEmpty()) { killers[ply] = m.key(); hist[m.from * 32 + m.to] += d * d }
+                          break
+                      }
+                  }
+                  val fl = if (best >= beta) 1 else if (best <= a0) 2 else 0
+                  tKey[idx] = p.hash
+                  tMove[idx] = bm?.key() ?: 0L
+                  tInfo[idx] = ((best + 40000) shl 10) or (d.coerceIn(0, 255) shl 2) or fl
+                  return best
+              }
+
+              // лучший ход за время ms (раньше, если ход единственный или найден выигрыш)
+              fun best(pos: Pos, ms: Int): Move? {
+                  val p = pos.copy()
+                  val legal = p.moves()
+                  score = 0; depth = 0; bestLine = null
+                  if (legal.isEmpty()) return null
+                  if (legal.size == 1) { bestLine = legal[0]; return legal[0] }
+                  val t0 = System.currentTimeMillis()
+                  deadline = t0 + ms
+                  abort = false
+                  nodes = 0
+                  java.util.Arrays.fill(killers, 0L)
+                  for (i in hist.indices) hist[i] = hist[i] shr 2
+                  var result: Move = legal[0]
+                  var d = 1
+                  var stable = 0
+                  while (d <= 60) {
+                      bestLine = null
+                      val v = ab(p, d, -MATE * 2, MATE * 2, 0)
+                      if (abort) break
+                      val bl = bestLine
+                      if (bl != null) {
+                          if (bl.key() == result.key()) stable++ else stable = 0
+                          result = bl
+                      }
+                      score = v; depth = d
+                      val el = System.currentTimeMillis() - t0
+                      if (Math.abs(v) > MATE - 300) break
+                      if (el > ms * 0.55) break
+                      if (d >= 16 && stable >= 4 && el > ms * 0.3) break
+                      d++
+                  }
+                  return result
+              }
+
+              fun isWin(s: Int) = Math.abs(s) > MATE - 300
+              fun pliesToWin(s: Int) = MATE - Math.abs(s)
+          }
+          EOF
+                    cat > app/src/main/java/com/helper/checkers/CaptureService.kt <<'EOF'
           package com.helper.checkers
 
           import android.app.*
@@ -527,67 +660,7 @@ jobs:
           import kotlin.math.min
           import kotlin.math.sqrt
 
-          class CheckersEngine(path: String) {
-              private val p = ProcessBuilder(path).redirectErrorStream(true).start()
-              private val w = p.outputStream.bufferedWriter()
-              private val r = p.inputStream.bufferedReader()
-              var score = ""
-              var depth = 0
-              var activeVariant = "chess"
-
-              init {
-                  val uciLines = ArrayList<String>()
-                  send("uci")
-                  while (true) {
-                      val l = r.readLine() ?: break
-                      uciLines.add(l)
-                      if (l.startsWith("uciok")) break
-                  }
-                  if (uciLines.none { it.startsWith("uciok") }) {
-                      p.destroy()
-                      throw RuntimeException("engine")
-                  }
-                  val variantsLine = uciLines.firstOrNull { it.startsWith("option name UCI_Variant ") }
-                  val candidates = listOf("russian", "draughts", "brazilian", "english", "frisian")
-                  val chosen = candidates.firstOrNull { v ->
-                      variantsLine?.contains("var $v", ignoreCase = true) == true
-                  } ?: "draughts"
-                  send("setoption name UCI_Variant value $chosen")
-                  activeVariant = chosen
-                  send("setoption name Hash value 64")
-                  send("isready")
-                  waitFor("readyok")
-              }
-
-              private fun send(s: String) { w.write(s + "\n"); w.flush() }
-              private fun waitFor(t: String): Boolean {
-                  while (true) { val l = r.readLine() ?: return false; if (l.startsWith(t)) return true }
-              }
-
-              fun best(fen: String, ms: Int, sign: Int): String {
-                  send("position fen $fen")
-                  send("go movetime $ms")
-                  score = ""; depth = 0
-                  val t0 = System.currentTimeMillis()
-                  val reS = Regex("score (cp|mate) (-?\\d+)")
-                  val reD = Regex(" depth (\\d+)")
-                  while (true) {
-                      val l = r.readLine() ?: return ""
-                      if (System.currentTimeMillis() - t0 > ms + 2500) { send("stop") }
-                      if (l.startsWith("info")) {
-                          reS.find(l)?.let { m ->
-                              val raw = m.groupValues[2].toInt() * sign
-                              score = if (m.groupValues[1] == "mate") "мат ${if (raw >= 0) "+" else ""}$raw"
-                              else String.format("%+.2f", raw / 100.0)
-                          }
-                          reD.find(l)?.groupValues?.get(1)?.toIntOrNull()?.let { if (it > 0) depth = it }
-                      }
-                      if (l.startsWith("bestmove")) return l.split(" ").getOrElse(1) { "" }
-                  }
-              }
-
-              fun quit() { try { send("quit") } catch (_: Exception) {}; p.destroy() }
-          }
+          class Cell(val occ: Boolean, val lum: Int, val vec: FloatArray, val bg: Int)
 
           class Overlay(c: Context) : View(c) {
               var cal = false
@@ -598,7 +671,8 @@ jobs:
               private var drag = false
               var msg = "Ищу доску…"
               var sub = ""
-              var ar: FloatArray? = null
+              var pts: FloatArray? = null
+              var boxes: List<RectF> = emptyList()
               var boardX = 0
               var boardY = 0
               var boardS = 0
@@ -638,31 +712,42 @@ jobs:
                       p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = 0xAAFFEB3B.toInt()
                       cv.drawRect(boardX.toFloat(), boardY.toFloat(), (boardX + boardS).toFloat(), (boardY + boardS).toFloat(), p)
                   }
-                  val arr = ar
-                  if (arrowOn && arr != null) {
-                      val dx = arr[2] - arr[0]
-                      val dy = arr[3] - arr[1]
-                      val len = sqrt(dx * dx + dy * dy)
-                      if (len > 1f) {
-                          val ux = dx / len
-                          val uy = dy / len
-                          val hx = arr[2] - ux * 44f
-                          val hy = arr[3] - uy * 44f
-                          p.style = Paint.Style.STROKE; p.strokeWidth = 18f; p.strokeCap = Paint.Cap.ROUND
-                          p.color = 0xE600C853.toInt()
-                          cv.drawLine(arr[0], arr[1], hx, hy, p)
-                          p.style = Paint.Style.FILL
-                          val pa = Path()
-                          pa.moveTo(arr[2], arr[3])
-                          pa.lineTo(hx - uy * 36f, hy + ux * 36f)
-                          pa.lineTo(hx + uy * 36f, hy - ux * 36f)
-                          pa.close()
-                          cv.drawPath(pa, p)
+                  val pp = pts
+                  if (arrowOn && pp != null && pp.size >= 4) {
+                      p.style = Paint.Style.FILL; p.color = 0x4400C853
+                      for (r in boxes) cv.drawRect(r, p)
+                      p.strokeCap = Paint.Cap.ROUND
+                      val n = pp.size / 2
+                      for (k in 0 until n - 1) {
+                          val x0 = pp[k * 2]; val y0 = pp[k * 2 + 1]
+                          val x1 = pp[k * 2 + 2]; val y1 = pp[k * 2 + 3]
+                          val dx = x1 - x0; val dy = y1 - y0
+                          val len = sqrt(dx * dx + dy * dy)
+                          if (len < 1f) continue
+                          val ux = dx / len; val uy = dy / len
+                          val last = k == n - 2
+                          val hx = if (last) x1 - ux * 44f else x1
+                          val hy = if (last) y1 - uy * 44f else y1
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 18f; p.color = 0xE600C853.toInt()
+                          cv.drawLine(x0, y0, hx, hy, p)
+                          if (last) {
+                              p.style = Paint.Style.FILL
+                              val pa = Path()
+                              pa.moveTo(x1, y1)
+                              pa.lineTo(hx - uy * 36f, hy + ux * 36f)
+                              pa.lineTo(hx + uy * 36f, hy - ux * 36f)
+                              pa.close()
+                              cv.drawPath(pa, p)
+                          } else {
+                              p.style = Paint.Style.FILL
+                              cv.drawCircle(x1, y1, 16f, p)
+                          }
                       }
                   }
                   p.style = Paint.Style.FILL
+                  val h = height.toFloat()
                   val ph = if (sub.isEmpty()) 84f else 132f
-                  val top = 90f
+                  val top = if (boardS == 0 || boardY > 260) 90f else min(boardY + boardS + 30f, h - ph - 60f)
                   p.textSize = 44f
                   val w1 = p.measureText(msg)
                   p.textSize = 32f
@@ -681,8 +766,8 @@ jobs:
 
           class CaptureService : Service() {
               private val H = Handler(Looper.getMainLooper())
-              private val boardN = 8
-              private val sc = 2
+              private val SC = 2
+              private val SHIFTS = arrayOf(intArrayOf(0, 1), intArrayOf(0, -1), intArrayOf(1, 0), intArrayOf(-1, 0))
               private var proj: MediaProjection? = null
               private var reader: ImageReader? = null
               private var imgThread: HandlerThread? = null
@@ -692,17 +777,37 @@ jobs:
               private lateinit var wm: WindowManager
               private lateinit var lp: WindowManager.LayoutParams
               private var ov: Overlay? = null
-              private var eng: CheckersEngine? = null
               private var rx = 0
               private var ry = 0
               private var rs = 0
-              private var fw = 0
-              private var fh = 0
               @Volatile private var running = false
               @Volatile private var regionReady = false
               @Volatile private var recalReq = false
-              private var board = DraughtsBoard(boardN)
-              private var whiteBottom = true
+              private var last: IntArray? = null
+              private var fw = 0
+              private var fh = 0
+
+              // партия
+              private var russian = true
+              private var pos = Pos(true)
+              private val search = Search()
+              private var lb = true      // светлые внизу
+              private var mir = false    // доска зеркальная (левый нижний угол светлый)
+              private var orientKnown = false
+
+              // запомненный вид фигур: 0 светлая шашка, 1 светлая дамка, 2 тёмная шашка, 3 тёмная дамка
+              private val tpl = arrayOfNulls<FloatArray>(4)
+              private val dMan = floatArrayOf(0f, 0f)
+              private var haveLum = false
+              private var lumW = 200
+              private var lumB = 60
+              private var learnN = 0
+
+              private var unmatchedSince = 0L
+              private var needSync = false
+              private var lastSyncTry = 0L
+              private var badGrid = false
+              private var dbg = ""
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -714,13 +819,11 @@ jobs:
                   }
                   if (proj != null) return START_NOT_STICKY
                   val nm = getSystemService(NotificationManager::class.java)
-                  nm.createNotificationChannel(NotificationChannel("c", "Шашечный помощник", NotificationManager.IMPORTANCE_LOW))
-                  val n = Notification.Builder(this, "c")
-                      .setContentTitle("Шашечный помощник работает")
+                  nm.createNotificationChannel(NotificationChannel("c", "Помощник", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "c").setContentTitle("Шашечный помощник работает")
                       .setSmallIcon(android.R.drawable.ic_menu_view).build()
                   if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
                   else startForeground(1, n)
-
                   val data = i.getParcelableExtra<Intent>("data") ?: run { stopSelf(); return START_NOT_STICKY }
                   val mpm = getSystemService(MediaProjectionManager::class.java)
                   val pr = mpm.getMediaProjection(i.getIntExtra("code", 0), data)
@@ -728,7 +831,6 @@ jobs:
                       override fun onStop() { stopSelf() }
                   }, H)
                   proj = pr
-
                   wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
                   val dm = DisplayMetrics()
                   wm.defaultDisplay.getRealMetrics(dm)
@@ -738,14 +840,13 @@ jobs:
                   ht.start()
                   imgThread = ht
                   rd.setOnImageAvailableListener({ r ->
-                      val im = try { r.acquireLatestImage() } catch (_: Exception) { null }
+                      val im = try { r.acquireLatestImage() } catch (ex: Exception) { null }
                       if (im != null) {
                           synchronized(lock) { held?.close(); held = im; seq++ }
                       }
                   }, Handler(ht.looper))
                   pr.createVirtualDisplay("cap", dm.widthPixels, dm.heightPixels, dm.densityDpi,
                       DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null)
-
                   lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
                       WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -755,17 +856,8 @@ jobs:
                   lp.gravity = Gravity.TOP or Gravity.START
                   if (Build.VERSION.SDK_INT >= 28)
                       lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-
                   val o = Overlay(this)
-                  o.onRegion = { x, y, s ->
-                      rx = x; ry = y; rs = s
-                      H.post {
-                          lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                          wm.updateViewLayout(o, lp)
-                          o.boardX = rx; o.boardY = ry; o.boardS = rs; o.invalidate()
-                      }
-                      regionReady = true
-                  }
+                  o.onRegion = { x, y, s -> Thread { snapRegion(x, y, s) }.start() }
                   ov = o
                   wm.addView(o, lp)
                   running = true
@@ -773,21 +865,71 @@ jobs:
                   return START_NOT_STICKY
               }
 
-              private fun hideOverlay() { H.post { ov?.visibility = View.INVISIBLE } }
-              private fun showOverlay() { H.post { ov?.visibility = View.VISIBLE } }
-
-              private fun freshFrame() {
-                  val s0 = seq
-                  hideOverlay()
-                  val t = System.currentTimeMillis()
-                  while (seq == s0 && System.currentTimeMillis() - t < 350) Thread.sleep(10)
-                  Thread.sleep(90)
+              // ---------- геометрия: экранная клетка (r, c) <-> поле 0..31 ----------
+              private fun sqOf(r: Int, c: Int): Int {
+                  val rank = if (lb) 7 - r else r
+                  val f0 = if (lb) c else 7 - c
+                  val file = if (mir) 7 - f0 else f0
+                  return Geo.sq(file, rank)
               }
 
-              private fun cd(a: Int, b: Int): Int =
-                  abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
-                      abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
-                      abs((a and 255) - (b and 255))
+              private fun cellOf(i: Int): Int {
+                  val f0 = if (mir) 7 - Geo.file(i) else Geo.file(i)
+                  val c = if (lb) f0 else 7 - f0
+                  val r = if (lb) 7 - Geo.rank(i) else Geo.rank(i)
+                  return r * 8 + c
+              }
+
+              private fun ctr(i: Int): PointF {
+                  val cell = cellOf(i)
+                  val s = rs / 8f
+                  return PointF(rx + (cell % 8 + 0.5f) * s, ry + (cell / 8 + 0.5f) * s)
+              }
+
+              // ---------- оверлей ----------
+              private fun show(msg: String, m: Move?, sub: String = "") {
+                  var pts: FloatArray? = null
+                  var bxs: List<RectF> = emptyList()
+                  if (m != null) {
+                      val s = rs / 8f
+                      val a = ctr(m.from)
+                      val l = ArrayList<Float>()
+                      l.add(a.x); l.add(a.y)
+                      for (q in m.path) { val c = ctr(q); l.add(c.x); l.add(c.y) }
+                      pts = l.toFloatArray()
+                      val b = ctr(m.to)
+                      bxs = listOf(RectF(a.x - s / 2, a.y - s / 2, a.x + s / 2, a.y + s / 2),
+                          RectF(b.x - s / 2, b.y - s / 2, b.x + s / 2, b.y + s / 2))
+                  }
+                  val on = pts != null
+                  H.post {
+                      ov?.let {
+                          it.msg = msg; it.sub = sub; it.pts = pts; it.boxes = bxs; it.arrowOn = on
+                          it.visibility = View.VISIBLE
+                          it.invalidate()
+                      }
+                  }
+              }
+
+              private fun hideAll() { H.post { ov?.visibility = View.INVISIBLE } }
+              private fun showAll() { H.post { ov?.visibility = View.VISIBLE } }
+              private fun reShow() { H.post { ov?.let { it.arrowOn = it.pts != null; it.visibility = View.VISIBLE; it.invalidate() } } }
+              private fun setBoard() { H.post { ov?.let { it.boardX = rx; it.boardY = ry; it.boardS = rs; it.invalidate() } } }
+              private fun enableManual() {
+                  ov?.let {
+                      it.cal = true
+                      it.msg = "Не нашёл доску. Обведи её по краям"
+                      it.sub = "Потяни от левого верхнего угла к правому нижнему"
+                      it.pts = null
+                      lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      wm.updateViewLayout(it, lp)
+                      it.visibility = View.VISIBLE
+                      it.invalidate()
+                  }
+              }
+
+              // ---------- захват экрана ----------
+              private fun lum(p: Int) = (((p shr 16) and 255) * 30 + ((p shr 8) and 255) * 59 + (p and 255) * 11) / 100
 
               private fun fullShot(): IntArray? = synchronized(lock) {
                   val img = held ?: return@synchronized null
@@ -796,14 +938,16 @@ jobs:
                       val buf = pl.buffer
                       val st = pl.rowStride
                       val ps = pl.pixelStride
-                      val sw = img.width / sc
-                      val sh = img.height / sc
+                      val sw = img.width / SC
+                      val sh = img.height / SC
                       val out = IntArray(sw * sh)
                       for (y in 0 until sh) {
                           for (x in 0 until sw) {
-                              var r = 0; var g = 0; var b = 0
+                              var r = 0
+                              var g = 0
+                              var b = 0
                               for (dy in 0..1) for (dx in 0..1) {
-                                  val o = (y * sc + dy) * st + (x * sc + dx) * ps
+                                  val o = (y * SC + dy) * st + (x * SC + dx) * ps
                                   r += buf.get(o).toInt() and 255
                                   g += buf.get(o + 1).toInt() and 255
                                   b += buf.get(o + 2).toInt() and 255
@@ -811,54 +955,200 @@ jobs:
                               out[y * sw + x] = (0xFF shl 24) or ((r / 4) shl 16) or ((g / 4) shl 8) or (b / 4)
                           }
                       }
-                      fw = sw; fh = sh
+                      fw = sw
+                      fh = sh
                       out
-                  } catch (_: Exception) { null }
+                  } catch (e: Exception) { null }
+              }
+
+              // область доски, приведённая к 256x256
+              private fun grab(): IntArray? = synchronized(lock) {
+                  val img = held ?: return@synchronized last
+                  try {
+                      val pl = img.planes[0]
+                      val buf = pl.buffer
+                      val st = pl.rowStride
+                      val ps = pl.pixelStride
+                      val bw = img.width
+                      val bh = img.height
+                      val x0 = rx.coerceIn(0, bw - 1)
+                      val y0 = ry.coerceIn(0, bh - 1)
+                      val s = minOf(rs, bw - x0, bh - y0)
+                      if (s < 64) return@synchronized last
+                      val out = IntArray(65536)
+                      val step = s / 256f
+                      for (v in 0 until 256) {
+                          for (u in 0 until 256) {
+                              var r = 0
+                              var g = 0
+                              var b = 0
+                              for (dy in 0..2) {
+                                  val yy = min((y0 + (v + (dy + 0.5f) / 3f) * step).toInt(), bh - 1)
+                                  for (dx in 0..2) {
+                                      val xx = min((x0 + (u + (dx + 0.5f) / 3f) * step).toInt(), bw - 1)
+                                      val o = yy * st + xx * ps
+                                      r += buf.get(o).toInt() and 255
+                                      g += buf.get(o + 1).toInt() and 255
+                                      b += buf.get(o + 2).toInt() and 255
+                                  }
+                              }
+                              out[v * 256 + u] = (0xFF shl 24) or ((r / 9) shl 16) or ((g / 9) shl 8) or (b / 9)
+                          }
+                      }
+                      last = out
+                      out
+                  } catch (e: Exception) { last }
+              }
+
+              private fun freshFrame() {
+                  val s0 = seq
+                  hideAll()
+                  val t = System.currentTimeMillis()
+                  while (seq == s0 && System.currentTimeMillis() - t < 400) Thread.sleep(10)
+                  Thread.sleep(110)
+              }
+
+              private fun waitFrame() {
+                  val s0 = seq
+                  val t = System.currentTimeMillis()
+                  while (seq == s0 && System.currentTimeMillis() - t < 300) Thread.sleep(10)
+                  Thread.sleep(60)
+              }
+
+              private fun clean(restore: Boolean = true): IntArray? {
+                  freshFrame()
+                  val g = grab()
+                  if (restore) showAll()
+                  return g
+              }
+
+              private fun cellDiff(a: IntArray, b: IntArray): BooleanArray {
+                  val m = BooleanArray(64)
+                  for (r in 0..7) for (c in 0..7) {
+                      var s = 0
+                      for (y in 5..26) for (x in 5..26) {
+                          val i = (r * 32 + y) * 256 + c * 32 + x
+                          s += abs(lum(a[i]) - lum(b[i]))
+                      }
+                      m[r * 8 + c] = s / 484 > 6
+                  }
+                  return m
+              }
+
+              // ---------- поиск доски ----------
+              private fun cd(a: Int, b: Int): Int =
+                  abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
+                      abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
+                      abs((a and 255) - (b and 255))
+
+              private fun modeColor(l: List<Int>): Int {
+                  var b = l[0]
+                  var bn = -1
+                  for (a in l) {
+                      var n = 0
+                      for (d in l) if (cd(a, d) < 30) n++
+                      if (n > bn) { bn = n; b = a }
+                  }
+                  return b
+              }
+
+              private fun bc(b: Int): Int =
+                  (((((b shr 8) and 15) * 16) + 8) shl 16) or (((((b shr 4) and 15) * 16) + 8) shl 8) or (((b and 15) * 16) + 8)
+
+              // замер по углам клеток: шашки круглые и занимают центр, углы почти всегда свободны
+              private val OX = floatArrayOf(0.12f, 0.88f, 0.12f, 0.88f)
+              private val OY = floatArrayOf(0.12f, 0.12f, 0.88f, 0.88f)
+
+              private fun checker(px: IntArray, w: Int, h: Int, x0: Float, y0: Float, pit: Float, cA: Int, cB: Int): Int {
+                  var ok1 = 0
+                  var ok2 = 0
+                  for (r in 0..7) for (c in 0..7) {
+                      var h1 = 0
+                      var h2 = 0
+                      for (k in 0..3) {
+                          val xx = (x0 + (c + OX[k]) * pit).toInt()
+                          val yy = (y0 + (r + OY[k]) * pit).toInt()
+                          if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue
+                          val v = px[yy * w + xx]
+                          val isA = cd(v, cA) < 48
+                          val isB = cd(v, cB) < 48
+                          if ((r + c) % 2 == 0) { if (isA) h1++; if (isB) h2++ } else { if (isB) h1++; if (isA) h2++ }
+                      }
+                      if (h1 >= 3) ok1++
+                      if (h2 >= 3) ok2++
+                  }
+                  return max(ok1, ok2)
+              }
+
+              private fun longestRun(c: IntArray, lo: Int, hi: Int, thr: Int, gap: Int): IntArray? {
+                  var bs = -1
+                  var be = -1
+                  var s = -1
+                  var lst = -1
+                  for (i in lo until hi) {
+                      if (c[i] >= thr) {
+                          if (s < 0) s = i
+                          lst = i
+                      } else if (s >= 0 && i - lst > gap) {
+                          if (bs < 0 || lst - s > be - bs) { bs = s; be = lst }
+                          s = -1
+                      }
+                  }
+                  if (s >= 0 && (bs < 0 || lst - s > be - bs)) { bs = s; be = lst }
+                  return if (bs < 0) null else intArrayOf(bs, be)
               }
 
               private fun checkerAdapt(px: IntArray, w: Int, h: Int, x0: Float, y0: Float, pit: Float): Int {
-                  if (pit < 4f || x0 < 0f || y0 < 0f || x0 + pit * boardN > w + 1f || y0 + pit * boardN > h + 1f) return 0
-                  val ox = floatArrayOf(0.86f, 0.14f, 0.10f, 0.90f)
-                  val oy = floatArrayOf(0.14f, 0.86f, 0.50f, 0.50f)
-                  val total = boardN * boardN
-                  val cr = IntArray(total); val cg = IntArray(total); val cb = IntArray(total)
-                  val sr = IntArray(4); val sg = IntArray(4); val sb = IntArray(4)
-                  for (r in 0 until boardN) for (c in 0 until boardN) {
+                  if (pit < 4f || x0 < 0f || y0 < 0f || x0 + pit * 8f > w + 1f || y0 + pit * 8f > h + 1f) return 0
+                  val cr = IntArray(64)
+                  val cg = IntArray(64)
+                  val cb = IntArray(64)
+                  val sr = IntArray(4)
+                  val sg = IntArray(4)
+                  val sb = IntArray(4)
+                  for (r in 0..7) for (c in 0..7) {
                       for (k in 0..3) {
-                          val xx = (x0 + (c + ox[k]) * pit).toInt().coerceIn(0, w - 1)
-                          val yy = (y0 + (r + oy[k]) * pit).toInt().coerceIn(0, h - 1)
+                          val xx = (x0 + (c + OX[k]) * pit).toInt().coerceIn(0, w - 1)
+                          val yy = (y0 + (r + OY[k]) * pit).toInt().coerceIn(0, h - 1)
                           val v = px[yy * w + xx]
                           sr[k] = (v shr 16) and 255
                           sg[k] = (v shr 8) and 255
                           sb[k] = v and 255
                       }
                       sr.sort(); sg.sort(); sb.sort()
-                      val i = r * boardN + c
+                      val i = r * 8 + c
                       cr[i] = (sr[1] + sr[2]) / 2
                       cg[i] = (sg[1] + sg[2]) / 2
                       cb[i] = (sb[1] + sb[2]) / 2
                   }
                   val med = IntArray(6)
                   for (par in 0..1) {
-                      val lr = ArrayList<Int>(); val lg = ArrayList<Int>(); val lb = ArrayList<Int>()
-                      for (i in 0 until total) if (((i / boardN) + (i % boardN)) % 2 == par) {
-                          lr.add(cr[i]); lg.add(cg[i]); lb.add(cb[i])
+                      val lr = IntArray(32)
+                      val lg = IntArray(32)
+                      val lbb = IntArray(32)
+                      var n = 0
+                      for (i in 0..63) {
+                          if (((i / 8) + (i % 8)) % 2 == par) {
+                              lr[n] = cr[i]; lg[n] = cg[i]; lbb[n] = cb[i]
+                              n++
+                          }
                       }
-                      lr.sort(); lg.sort(); lb.sort()
-                      val mid = lr.size / 2
-                      med[par * 3] = lr[mid]; med[par * 3 + 1] = lg[mid]; med[par * 3 + 2] = lb[mid]
+                      lr.sort(); lg.sort(); lbb.sort()
+                      med[par * 3] = lr[16]
+                      med[par * 3 + 1] = lg[16]
+                      med[par * 3 + 2] = lbb[16]
                   }
                   val cA = (med[0] shl 16) or (med[1] shl 8) or med[2]
                   val cB = (med[3] shl 16) or (med[4] shl 8) or med[5]
-                  if (cd(cA, cB) < 32) return 0
+                  if (cd(cA, cB) < 36) return 0
                   var ok = 0
-                  for (i in 0 until total) {
-                      val par = ((i / boardN) + (i % boardN)) % 2
+                  for (i in 0..63) {
+                      val par = ((i / 8) + (i % 8)) % 2
                       val v = (cr[i] shl 16) or (cg[i] shl 8) or cb[i]
                       val own = if (par == 0) cA else cB
                       val oth = if (par == 0) cB else cA
                       val d = cd(v, own)
-                      if (d < 56 && d < cd(v, oth)) ok++
+                      if (d < 54 && d < cd(v, oth)) ok++
                   }
                   return ok
               }
@@ -877,16 +1167,19 @@ jobs:
                   val all = ArrayList<FloatArray>()
                   var p = pMin
                   while (p <= pMax) {
-                      var bx = -1; var bsc = 0; var x0 = lo
-                      while (x0 + boardN * p <= hi + 3f) {
-                          var sc = 0; var mn = Int.MAX_VALUE
-                          for (k in 1 until boardN) {
+                      var bx = -1
+                      var bsc = 0
+                      var x0 = lo
+                      while (x0 + 8f * p <= hi + 3f) {
+                          var sc = 0
+                          var mn = Int.MAX_VALUE
+                          for (k in 1..7) {
                               val i = (x0 + k * p + 0.5f).toInt()
-                              val v = if (i in lo until hi) prof[i] else 0
+                              val v = if (i >= lo && i < hi) prof[i] else 0
                               sc += v
                               if (v < mn) mn = v
                           }
-                          if (mn > 0 && mn * 16 >= sc && sc > bsc) { bsc = sc; bx = x0 }
+                          if (mn > 0 && mn * 14 >= sc && sc > bsc) { bsc = sc; bx = x0 }
                           x0++
                       }
                       if (bx >= 0) all.add(floatArrayOf(bx.toFloat(), p, bsc.toFloat()))
@@ -895,7 +1188,10 @@ jobs:
                   all.sortByDescending { it[2] }
                   val out = ArrayList<FloatArray>()
                   for (c in all) {
-                      val dup = out.any { abs(it[0] - c[0]) < 0.4f * c[1] && abs(it[1] - c[1]) < 2f }
+                      var dup = false
+                      for (o in out) {
+                          if (abs(o[0] - c[0]) < 0.4f * c[1] && abs(o[1] - c[1]) < 2f) { dup = true; break }
+                      }
                       if (!dup) {
                           out.add(c)
                           if (out.size >= n) break
@@ -904,27 +1200,34 @@ jobs:
                   return out
               }
 
-              private fun detectBoard(px: IntArray, w: Int, h: Int): IntArray? {
-                  if (w < 80 || h < 80) return null
-                  val colE = IntArray(w); val rowE = IntArray(h)
-                  for (y in 0 until h - 2) {
-                      val o = y * w; val o2 = o + 2 * w
-                      for (x in 0 until w - 2) {
+              private fun detectBoardEdge(px: IntArray, w: Int, h: Int, roi: IntArray?): IntArray? {
+                  val x0r = max(roi?.get(0) ?: 0, 0)
+                  val y0r = max(roi?.get(1) ?: 0, 0)
+                  val x1r = min(roi?.get(2) ?: w, w)
+                  val y1r = min(roi?.get(3) ?: h, h)
+                  if (x1r - x0r < 40 || y1r - y0r < 40) return null
+                  val colE = IntArray(w)
+                  val rowE = IntArray(h)
+                  for (y in y0r until y1r - 2) {
+                      val o = y * w
+                      val o2 = o + 2 * w
+                      for (x in x0r until x1r - 2) {
                           val p = px[o + x]
-                          if (cd(p, px[o + x + 2]) > 22) colE[x + 1]++
-                          if (cd(p, px[o2 + x]) > 22) rowE[y + 1]++
+                          if (cd(p, px[o + x + 2]) > 24) colE[x + 1]++
+                          if (cd(p, px[o2 + x]) > 24) rowE[y + 1]++
                       }
                   }
-                  val cm = smoothMax(colE, 0, w)
-                  val rm = smoothMax(rowE, 0, h)
-                  val side = min(w, h)
-                  val pMin = max(8f, 0.25f * side / boardN)
-                  val pMax = side / boardN.toFloat() + 1f
-                  val cc = gridCands(cm, 0, w, pMin, pMax, 8)
-                  val rc = gridCands(rm, 0, h, pMin, pMax, 8)
-                  val minMatch = (boardN * boardN * 0.68f).toInt()
-
-                  var bsc0 = 0; var bx0 = 0f; var by0 = 0f; var bbp = 0f
+                  val cm = smoothMax(colE, x0r, x1r)
+                  val rm = smoothMax(rowE, y0r, y1r)
+                  val side = min(x1r - x0r, y1r - y0r)
+                  val pMin = if (roi == null) max(8f, 0.25f * side / 8f) else 0.55f * side / 8f
+                  val pMax = side / 8f + 1f
+                  val cc = gridCands(cm, x0r, x1r, pMin, pMax, 8)
+                  val rc = gridCands(rm, y0r, y1r, pMin, pMax, 8)
+                  var bsc0 = 0
+                  var bx0 = 0f
+                  var by0 = 0f
+                  var bbp = 0f
                   for (c in cc) for (r in rc) {
                       if (abs(c[1] - r[1]) > 2.5f) continue
                       val bp = (c[1] + r[1]) / 2f
@@ -937,350 +1240,702 @@ jobs:
                           }
                       }
                   }
-                  if (bsc0 < minMatch) return null
-
-                  var best: IntArray? = null; var bsc = 0; var bpit = 0f
+                  if (bsc0 < 44) return null
+                  var best: IntArray? = null
+                  var bsc = 0
+                  var bpit = 0f
                   for (dp in -4..4) {
                       val pit = bbp + dp * 0.25f
                       for (dx in -2..2) for (dy in -2..2) {
                           val sc = checkerAdapt(px, w, h, bx0 + dx, by0 + dy, pit)
                           if (sc > bsc || (sc == bsc && sc > 0 && pit > bpit)) {
-                              bsc = sc; bpit = pit
-                              best = intArrayOf((bx0 + dx + 0.5f).toInt(), (by0 + dy + 0.5f).toInt(), (pit * boardN + 0.5f).toInt())
+                              bsc = sc
+                              bpit = pit
+                              best = intArrayOf((bx0 + dx + 0.5f).toInt(), (by0 + dy + 0.5f).toInt(), (pit * 8f + 0.5f).toInt())
                           }
                       }
                   }
-                  return if (bsc >= minMatch) best else null
+                  return if (bsc >= 44) best else null
               }
 
-              private fun autoFindBoard(): Boolean {
-                  freshFrame()
-                  val px = fullShot()
-                  showOverlay()
-                  if (px == null) return false
-                  val r = detectBoard(px, fw, fh) ?: return false
-                  rx = r[0] * sc; ry = r[1] * sc; rs = r[2] * sc
-                  H.post {
-                      ov?.let {
-                          it.cal = false
-                          lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                          wm.updateViewLayout(it, lp)
-                          it.boardX = rx; it.boardY = ry; it.boardS = rs; it.invalidate()
+              private fun detectBoard(px: IntArray, w: Int, h: Int, roi: IntArray? = null): IntArray? {
+                  val r = try { detectBoardEdge(px, w, h, roi) } catch (e: Exception) { null }
+                  return r ?: try { detectBoardColor(px, w, h, roi) } catch (e: Exception) { null }
+              }
+
+              private fun detectBoardColor(px: IntArray, w: Int, h: Int, roi: IntArray? = null): IntArray? {
+                  val x0r = max(roi?.get(0) ?: 0, 0)
+                  val y0r = max(roi?.get(1) ?: 0, 0)
+                  val x1r = min(roi?.get(2) ?: w, w)
+                  val y1r = min(roi?.get(3) ?: h, h)
+                  if (x1r - x0r < 40 || y1r - y0r < 40) return null
+                  val bins = IntArray(w * h)
+                  val cnt = IntArray(4096)
+                  for (y in y0r until y1r) {
+                      val o = y * w
+                      for (x in x0r until x1r) {
+                          val p = px[o + x]
+                          val b = (((p shr 20) and 15) shl 8) or (((p shr 12) and 15) shl 4) or ((p shr 4) and 15)
+                          bins[o + x] = b
+                          cnt[b]++
                       }
                   }
+                  val area = (x1r - x0r) * (y1r - y0r)
+                  val top = (0 until 4096).sortedByDescending { cnt[it] }.take(8).filter { cnt[it] > area / 80 }
+                  if (top.size < 2) return null
+                  val cols = top.map { bc(it) }
+                  val mt = Array(top.size) { k -> BooleanArray(4096) { b -> cd(bc(b), cols[k]) < 40 } }
+                  val minS = if (roi == null) (0.3f * w).toInt() else 40
+                  var best: IntArray? = null
+                  var bestSc = 0
+                  for (i in top.indices) for (j in i + 1 until top.size) {
+                      if (cd(cols[i], cols[j]) < 40) continue
+                      val ma = mt[i]
+                      val mb = mt[j]
+                      val rowC = IntArray(h)
+                      val colC = IntArray(w)
+                      var y = y0r
+                      while (y < y1r) {
+                          val o = y * w
+                          var rc = 0
+                          for (x in x0r until x1r) {
+                              val b = bins[o + x]
+                              if (ma[b] || mb[b]) { rc++; colC[x]++ }
+                          }
+                          rowC[y] = rc
+                          if (y + 1 < y1r) rowC[y + 1] = rc
+                          y += 2
+                      }
+                      var mxR = 0
+                      for (yy in y0r until y1r) mxR = max(mxR, rowC[yy])
+                      var mxC = 0
+                      for (xx in x0r until x1r) mxC = max(mxC, colC[xx])
+                      if (mxR < 40 || mxC < 20) continue
+                      val rr = longestRun(rowC, y0r, y1r, (mxR * 0.4f).toInt(), 6) ?: continue
+                      val cc = longestRun(colC, x0r, x1r, (mxC * 0.4f).toInt(), 6) ?: continue
+                      val bw = cc[1] - cc[0] + 1
+                      val bh = rr[1] - rr[0] + 1
+                      val side = if (abs(bw - bh) <= 0.06f * max(bw, bh)) (bw + bh) / 2 else min(bw, bh)
+                      if (side < minS) continue
+                      val xl = ArrayList<Int>()
+                      val yl = ArrayList<Int>()
+                      if (bw - side <= 3) xl.add(cc[0] + (bw - side) / 2) else {
+                          var x = cc[0]
+                          val stp = max(2, side / 60)
+                          while (x <= cc[1] - side + 1) { xl.add(x); x += stp }
+                      }
+                      if (bh - side <= 3) yl.add(rr[0] + (bh - side) / 2) else {
+                          var yy = rr[0]
+                          val stp = max(2, side / 60)
+                          while (yy <= rr[1] - side + 1) { yl.add(yy); yy += stp }
+                      }
+                      var bx = 0
+                      var by2 = 0
+                      var bsd = side
+                      var bsc = -1
+                      for (xx in xl) for (yy in yl) {
+                          val sc = checker(px, w, h, xx.toFloat(), yy.toFloat(), side / 8f, cols[i], cols[j])
+                          if (sc > bsc) { bsc = sc; bx = xx; by2 = yy }
+                      }
+                      val cx = bx
+                      val cy = by2
+                      val cs = bsd
+                      for (ds in -2..2) for (dx in -2..2) for (dy in -2..2) {
+                          val sd = cs + ds
+                          if (sd < minS) continue
+                          val sc = checker(px, w, h, (cx + dx).toFloat(), (cy + dy).toFloat(), sd / 8f, cols[i], cols[j])
+                          if (sc > bsc) { bsc = sc; bx = cx + dx; by2 = cy + dy; bsd = sd }
+                      }
+                      if (bsc >= 44 && bsc > bestSc && bx >= 0 && by2 >= 0) {
+                          bestSc = bsc
+                          best = intArrayOf(bx, by2, bsd)
+                      }
+                  }
+                  return best
+              }
+
+              private fun snapRegion(x: Int, y: Int, s: Int) {
+                  var nx = x
+                  var ny = y
+                  var ns = s
+                  try {
+                      freshFrame()
+                      val px = fullShot()
+                      showAll()
+                      if (px != null) {
+                          val m = (s * 0.12f).toInt()
+                          val r = detectBoard(px, fw, fh, intArrayOf((x - m) / SC, (y - m) / SC, (x + s + m) / SC, (y + s + m) / SC))
+                          if (r != null) { nx = r[0] * SC; ny = r[1] * SC; ns = r[2] * SC }
+                      }
+                  } catch (ex: Exception) { }
+                  rx = nx; ry = ny; rs = ns
+                  H.post {
+                      ov?.let {
+                          lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          wm.updateViewLayout(it, lp)
+                      }
+                  }
+                  setBoard()
+                  regionReady = true
+              }
+                            // ---------- чтение клеток ----------
+              // фон клетки берём по углам (шашка круглая и углы не закрывает), шашку ищем в круге в центре
+              private fun cellsInfo(f: IntArray): Array<Cell> {
+                  val sxs = intArrayOf(1, 28, 1, 28)
+                  val sys = intArrayOf(1, 1, 28, 28)
+                  return Array(64) { idx ->
+                      val r = idx / 8
+                      val c = idx % 8
+                      val ra = IntArray(36)
+                      val ga = IntArray(36)
+                      val ba = IntArray(36)
+                      var k = 0
+                      for (q in 0..3) for (dy in 0..2) for (dx in 0..2) {
+                          val p = f[(r * 32 + sys[q] + dy) * 256 + c * 32 + sxs[q] + dx]
+                          ra[k] = (p shr 16) and 255; ga[k] = (p shr 8) and 255; ba[k] = p and 255
+                          k++
+                      }
+                      ra.sort(); ga.sort(); ba.sort()
+                      val mr = ra[18]
+                      val mg = ga[18]
+                      val mb = ba[18]
+                      var cnt = 0
+                      var minx = 99
+                      var maxx = -1
+                      var miny = 99
+                      var maxy = -1
+                      val lums = IntArray(400)
+                      var nl = 0
+                      for (y in 4..27) for (x in 4..27) {
+                          val ddx = x - 15.5f
+                          val ddy = y - 15.5f
+                          val rr = ddx * ddx + ddy * ddy
+                          if (rr > 121f) continue
+                          val p = f[(r * 32 + y) * 256 + c * 32 + x]
+                          val d = abs(((p shr 16) and 255) - mr) + abs(((p shr 8) and 255) - mg) + abs((p and 255) - mb)
+                          if (d > 40) {
+                              cnt++
+                              if (x < minx) minx = x
+                              if (x > maxx) maxx = x
+                              if (y < miny) miny = y
+                              if (y > maxy) maxy = y
+                              if (rr <= 81f && nl < 400) { lums[nl++] = lum(p) }
+                          }
+                      }
+                      val occ = cnt > 110 && maxy - miny >= 12 && maxx - minx >= 12
+                      var lm = 0
+                      if (nl > 0) { val a = lums.copyOf(nl); a.sort(); lm = a[nl / 2] }
+                      // узор внутри шашки (корона дамки): яркость относительно медианы, 10x10, только внутри круга
+                      val vec = FloatArray(100)
+                      if (occ) {
+                          for (gy in 0..9) for (gx in 0..9) {
+                              val cx = 6 + gx * 2 + 1 - 15.5f
+                              val cy = 6 + gy * 2 + 1 - 15.5f
+                              if (cx * cx + cy * cy > 100f) continue
+                              var s = 0
+                              for (dy in 0..1) for (dx in 0..1) s += lum(f[(r * 32 + 6 + gy * 2 + dy) * 256 + c * 32 + 6 + gx * 2 + dx])
+                              vec[gy * 10 + gx] = abs(s / 4 - lm).toFloat()
+                          }
+                      }
+                      Cell(occ, lm, vec, (mr shl 16) or (mg shl 8) or mb)
+                  }
+              }
+
+              // порог яркости «светлые / тёмные шашки»
+              private fun lumThr(cells: Array<Cell>): Int {
+                  val l = ArrayList<Int>()
+                  for (c in cells) if (c.occ) l.add(c.lum)
+                  if (l.size >= 2) {
+                      var a = l.minOrNull() ?: 0
+                      var b = l.maxOrNull() ?: 255
+                      repeat(8) {
+                          val m = (a + b) / 2
+                          var sa = 0
+                          var na = 0
+                          var sb = 0
+                          var nb = 0
+                          for (v in l) { if (v <= m) { sa += v; na++ } else { sb += v; nb++ } }
+                          if (na > 0) a = sa / na
+                          if (nb > 0) b = sb / nb
+                      }
+                      if (b - a >= 35) return (a + b) / 2
+                  }
+                  return if (haveLum) (lumW + lumB) / 2 else 128
+              }
+
+              // какие клетки игровые: обычно (r+c) нечётные; если шашки стоят на чётных, доска зеркальная
+              private fun updMirror(cells: Array<Cell>) {
+                  var a = 0
+                  var b = 0
+                  for (i in 0..63) if (cells[i].occ) { if ((i / 8 + i % 8) % 2 == 1) a++ else b++ }
+                  if (a + b >= 4) {
+                      if (b > a * 3) mir = true else if (a > b * 3) mir = false
+                  }
+              }
+
+              private fun wrongCells(cells: Array<Cell>): Int {
+                  var n = 0
+                  for (i in 0..63) if (cells[i].occ && sqOf(i / 8, i % 8) < 0) n++
+                  return n
+              }
+
+              // цвета на полях: 0 пусто, 1 светлая, 2 тёмная
+              private fun colors(cells: Array<Cell>, thr: Int): IntArray {
+                  val g = IntArray(32)
+                  for (i in 0..31) {
+                      val cell = cells[cellOf(i)]
+                      if (cell.occ) g[i] = if (cell.lum > thr) 1 else 2
+                  }
+                  return g
+              }
+
+              private fun posColors(p: Pos): IntArray = IntArray(32) { val s = sideOf(p.b[it]); if (s < 0) 0 else s + 1 }
+
+              private fun mism(a: IntArray, b: IntArray): Int {
+                  var d = 0
+                  for (i in a.indices) if (a[i] != b[i]) d++
+                  return d
+              }
+
+              // ---------- шаблоны: шашка или дамка ----------
+              private fun vdist(t: FloatArray, v: FloatArray): Float {
+                  var best = 1e9f
+                  for (dy in -1..1) for (dx in -1..1) {
+                      var d = 0f
+                      for (y in 0..9) {
+                          val yy = y + dy
+                          for (x in 0..9) {
+                              val xx = x + dx
+                              val b = if (yy in 0..9 && xx in 0..9) v[yy * 10 + xx] else 0f
+                              d += abs(t[y * 10 + x] - b)
+                          }
+                      }
+                      if (d < best) best = d
+                  }
+                  return best
+              }
+
+              private fun medianVec(l: List<FloatArray>): FloatArray {
+                  val o = FloatArray(100)
+                  val tmp = FloatArray(l.size)
+                  for (k in 0..99) {
+                      for (j in l.indices) tmp[j] = l[j][k]
+                      tmp.sort()
+                      o[k] = tmp[l.size / 2]
+                  }
+                  return o
+              }
+
+              private fun kingGuess(cells: Array<Cell>, col: IntArray): BooleanArray {
+                  val res = BooleanArray(32)
+                  for (c in 0..1) {
+                      val sqs = (0..31).filter { col[it] == c + 1 }
+                      if (sqs.isEmpty()) continue
+                      val tm = tpl[c * 2]
+                      val tk = tpl[c * 2 + 1]
+                      if (tm != null) {
+                          val thr = max(3f * dMan[c], dMan[c] + 150f)
+                          for (i in sqs) {
+                              val v = cells[cellOf(i)].vec
+                              val dm = vdist(tm, v)
+                              res[i] = if (tk != null) vdist(tk, v) < dm else dm > thr
+                          }
+                      } else if (sqs.size >= 3) {
+                          val vs = sqs.map { cells[cellOf(it)].vec }
+                          val med = medianVec(vs)
+                          val ds = vs.map { vdist(med, it) }
+                          val md = ds.sorted()[ds.size / 2]
+                          for (k in sqs.indices) res[sqs[k]] = ds[k] > max(3f * md, md + 250f)
+                      }
+                      // шашка на последней горизонтали всегда дамка
+                      for (i in sqs) if (Geo.rank(i) == (if (c == 0) 7 else 0)) res[i] = true
+                  }
+                  return res
+              }
+
+              // учим вид фигур по известной позиции (цвета на экране должны совпадать)
+              private fun learn(cells: Array<Cell>, p: Pos, force: Boolean) {
+                  val acc = Array(4) { FloatArray(100) }
+                  val n = IntArray(4)
+                  var sw = 0; var nw = 0; var sb = 0; var nb = 0
+                  for (i in 0..31) {
+                      val pc = p.b[i]
+                      if (pc == 0) continue
+                      val cell = cells[cellOf(i)]
+                      if (!cell.occ) continue
+                      val t = pc - 1
+                      n[t]++
+                      for (k in 0..99) acc[t][k] += cell.vec[k]
+                      if (t < 2) { sw += cell.lum; nw++ } else { sb += cell.lum; nb++ }
+                  }
+                  var newKing = false
+                  for (t in 0..3) {
+                      if (n[t] == 0) continue
+                      val avg = FloatArray(100) { acc[t][it] / n[t] }
+                      val old = tpl[t]
+                      if (old == null) { if (t % 2 == 1) newKing = true; tpl[t] = avg }
+                      else if (force) tpl[t] = avg
+                      else for (k in 0..99) old[k] = old[k] * 0.7f + avg[k] * 0.3f
+                  }
+                  for (c in 0..1) {
+                      val tm = tpl[c * 2] ?: continue
+                      var s = 0f; var k = 0
+                      for (i in 0..31) if (p.b[i] == c * 2 + 1 && cells[cellOf(i)].occ) { s += vdist(tm, cells[cellOf(i)].vec); k++ }
+                      if (k > 0) dMan[c] = if (force) s / k else dMan[c] * 0.7f + (s / k) * 0.3f
+                  }
+                  if (nw > 0 && nb > 0) { lumW = sw / nw; lumB = sb / nb; haveLum = true }
+                  learnN++
+                  if (force || newKing || learnN % 10 == 0) save()
+              }
+
+              private fun save() {
+                  val sb = StringBuilder("$lumW,$lumB,${dMan[0]},${dMan[1]}")
+                  for (t in tpl) {
+                      sb.append(';')
+                      if (t == null) sb.append('-') else sb.append(t.joinToString(",") { (it * 10).toInt().toString() })
+                  }
+                  getSharedPreferences("t", Context.MODE_PRIVATE).edit().putString("ck1", sb.toString()).apply()
+              }
+
+              private fun load() {
+                  val s = getSharedPreferences("t", Context.MODE_PRIVATE).getString("ck1", null) ?: return
+                  try {
+                      val parts = s.split(";")
+                      val l = parts[0].split(",")
+                      lumW = l[0].toInt(); lumB = l[1].toInt()
+                      dMan[0] = l[2].toFloat(); dMan[1] = l[3].toFloat()
+                      for (t in 0..3) {
+                          val q = parts[t + 1]
+                          tpl[t] = if (q == "-") null else q.split(",").map { it.toInt() / 10f }.toFloatArray().also { if (it.size != 100) throw RuntimeException() }
+                      }
+                      haveLum = true
+                  } catch (e: Exception) { for (t in 0..3) tpl[t] = null; haveLum = false }
+              }
+
+              // ---------- определение позиции ----------
+              // кто ходил последним по подсветке клеток: 0 светлые, 1 тёмные, -1 неизвестно
+              private fun lastMover(cells: Array<Cell>, thr: Int): Int {
+                  val play = (0..63).filter { sqOf(it / 8, it % 8) >= 0 }
+                  val m = modeColor(play.map { cells[it].bg })
+                  var res = -1
+                  var cnt = 0
+                  var mix = false
+                  for (i in play) {
+                      if (cd(cells[i].bg, m) > 50) {
+                          cnt++
+                          if (cells[i].occ) {
+                              val c = if (cells[i].lum > thr) 0 else 1
+                              if (res == -1) res = c else if (res != c) mix = true
+                          }
+                      }
+                  }
+                  return if (cnt in 1..12 && !mix) res else -1
+              }
+
+              private fun resetSync() { unmatchedSince = 0L; needSync = false }
+
+              private fun newPos(): Pos { russian = getSharedPreferences("s", Context.MODE_PRIVATE).getInt("rules", 0) == 0; return Pos(russian) }
+
+              // начальная расстановка (допуск 1 клетка): по занятости, сторону определяем по яркости
+              private fun tryStart(cells: Array<Cell>, thr: Int): Boolean {
+                  updMirror(cells)
+                  var bottomL = 0; var bn = 0; var topL = 0; var tn = 0
+                  for (i in 0..63) {
+                      if (!cells[i].occ) continue
+                      if (i / 8 >= 4) { bottomL += cells[i].lum; bn++ } else { topL += cells[i].lum; tn++ }
+                  }
+                  if (bn == 0 || tn == 0) return false
+                  val nlb = bottomL / bn >= topL / tn
+                  val olb = lb
+                  lb = nlb
+                  val st = newPos()
+                  st.setStart()
+                  val sc = posColors(st)
+                  var d = 0
+                  for (i in 0..31) if ((sc[i] != 0) != cells[cellOf(i)].occ) d++
+                  if (d > 1 || wrongCells(cells) > 1) { lb = olb; return false }
+                  pos = st
+                  orientKnown = true
+                  learn(cells, st, true)
+                  search.clear()
+                  resetSync()
                   return true
               }
 
-              private fun detectWhiteBottom(): Boolean {
-                  val img = synchronized(lock) { held } ?: return true
-                  if (rs < 64) return true
-                  try {
-                      val pl = img.planes[0]
-                      val buf = pl.buffer
-                      val st = pl.rowStride
-                      val ps = pl.pixelStride
-                      val bw = img.width
-                      val bh = img.height
-                      val x0 = rx.coerceIn(0, bw - 1)
-                      val y0 = ry.coerceIn(0, bh - 1)
-                      val s = minOf(rs, bw - x0, bh - y0)
-                      val cell = s / boardN.toFloat()
+              // позиция целиком по экрану (партия в середине)
+              private fun tryScratch(cells: Array<Cell>, thr: Int): Boolean {
+                  updMirror(cells)
+                  if (wrongCells(cells) > 1) return false
+                  // ориентация: светлые шашки в среднем ниже тёмных
+                  var sl = 0; var nl = 0; var sd = 0; var nd = 0
+                  for (i in 0..63) {
+                      if (!cells[i].occ) continue
+                      if (cells[i].lum > thr) { sl += i / 8; nl++ } else { sd += i / 8; nd++ }
+                  }
+                  if (nl > 0 && nd > 0) {
+                      val diff = sl.toFloat() / nl - sd.toFloat() / nd
+                      if (!orientKnown || abs(diff) >= 1.5f) lb = diff >= 0
+                  }
+                  val col = colors(cells, thr)
+                  var cl = 0; var cdk = 0
+                  for (v in col) { if (v == 1) cl++; if (v == 2) cdk++ }
+                  if (cl > 12 || cdk > 12 || cl + cdk == 0) return false
+                  val kg = kingGuess(cells, col)
+                  val pcs = IntArray(32) { if (col[it] == 0) 0 else (col[it] - 1) * 2 + 1 + (if (kg[it]) 1 else 0) }
+                  val lm = lastMover(cells, thr)
+                  val me = if (lb) 0 else 1
+                  val side = if (lm >= 0) 1 - lm else me
+                  val np = newPos()
+                  np.load(pcs, side)
+                  pos = np
+                  orientKnown = true
+                  search.clear()
+                  resetSync()
+                  return true
+              }
 
-                      var botLumSum = 0f; var botCnt = 0
-                      var topLumSum = 0f; var topCnt = 0
-                      var botWhite = 0; var botBlack = 0
-                      val homeRows = if (boardN >= 10) 4 else 3
+              private fun establish(cells: Array<Cell>, thr: Int): Boolean = tryStart(cells, thr) || tryScratch(cells, thr)
 
-                      for (r in 0 until boardN) {
-                          for (c in 0 until boardN) {
-                              val bx = (x0 + (c + 0.12f) * cell).toInt().coerceIn(0, bw - 1)
-                              val by = (y0 + (r + 0.12f) * cell).toInt().coerceIn(0, bh - 1)
-                              val bo = by * st + bx * ps
-                              val br = buf.get(bo).toInt() and 255
-                              val bg = buf.get(bo + 1).toInt() and 255
-                              val bb = buf.get(bo + 2).toInt() and 255
+              // ход (или два полухода), после которого цвета на полях совпадают с экраном
+              private fun findMove(p: Pos, col: IntArray, kg: BooleanArray): Move? {
+                  var best: Move? = null
+                  var bk = 99
+                  for (m in p.moves()) {
+                      p.make(m)
+                      if (mism(posColors(p), col) == 0) {
+                          var k = 0
+                          for (i in 0..31) if (p.b[i] != 0 && isKing(p.b[i]) != kg[i]) k++
+                          if (k < bk) { bk = k; best = m }
+                      }
+                      p.unmake(m)
+                  }
+                  return best
+              }
 
-                              var sumL = 0f; var hits = 0
-                              for (dy in -2..2) for (dx in -2..2) {
-                                  val px = (x0 + (c + 0.5f) * cell + dx * (cell * 0.06f)).toInt().coerceIn(0, bw - 1)
-                                  val py = (y0 + (r + 0.5f) * cell + dy * (cell * 0.06f)).toInt().coerceIn(0, bh - 1)
-                                  val po = py * st + px * ps
-                                  val pr = buf.get(po).toInt() and 255
-                                  val pg = buf.get(po + 1).toInt() and 255
-                                  val pb = buf.get(po + 2).toInt() and 255
-                                  sumL += 0.299f * pr + 0.587f * pg + 0.114f * pb
-                                  if (abs(pr - br) + abs(pg - bg) + abs(pb - bb) > 46) hits++
-                              }
-                              if (hits < 6) continue
-                              val lum = sumL / 25f
-                              if (r >= boardN / 2) {
-                                  botLumSum += lum; botCnt++
-                              } else {
-                                  topLumSum += lum; topCnt++
-                              }
-                              if (r >= boardN - homeRows) {
-                                  if (lum >= 135f) botWhite++ else botBlack++
+              private fun findMove2(p: Pos, col: IntArray): Boolean {
+                  for (m1 in p.moves()) {
+                      p.make(m1)
+                      for (m2 in p.moves()) {
+                          p.make(m2)
+                          if (mism(posColors(p), col) == 0) return true
+                          p.unmake(m2)
+                      }
+                      p.unmake(m1)
+                  }
+                  return false
+              }
+
+              private fun noticeMsg(): String = "Не понял позицию, жду…"
+
+              // 1 = позиция обновилась, 0 = без изменений / не понял
+              private fun process(f: IntArray): Int {
+                  val cells = cellsInfo(f)
+                  val thr = lumThr(cells)
+                  val col = colors(cells, thr)
+                  var n = 0
+                  for (v in col) if (v != 0) n++
+                  val wrong = wrongCells(cells)
+                  badGrid = n > 24 || n < 1 || wrong > 2
+                  if (badGrid) { dbg = "шашек $n, лишних клеток $wrong"; needSync = true; return 0 }
+                  val pc = posColors(pos)
+                  if (mism(pc, col) == 0) { unmatchedSince = 0L; needSync = false; learn(cells, pos, false); return 0 }
+                  dbg = "расхождение с партией: ${mism(pc, col)} кл."
+                  val kg = kingGuess(cells, col)
+                  val mv = findMove(pos, col, kg)
+                  if (mv != null) { pos.make(mv); learn(cells, pos, false); resetSync(); return 1 }
+                  val p2 = pos.copy()
+                  if (findMove2(p2, col)) { pos = p2; learn(cells, pos, false); resetSync(); return 1 }
+                  val fl = pos.copy()
+                  fl.side = fl.side xor 1
+                  fl.rehash()
+                  val m3 = findMove(fl, col, kg)
+                  if (m3 != null) { fl.make(m3); pos = fl; resetSync(); return 1 }
+                  if (tryStart(cells, thr)) return 1
+                  val now = System.currentTimeMillis()
+                  if (unmatchedSince == 0L) unmatchedSince = now
+                  needSync = true
+                  if (now - unmatchedSince > 900) {
+                      if (tryScratch(cells, thr)) return 1
+                  }
+                  return 0
+              }
+
+              private fun fmtScore(): String {
+                  val s = if (pos.side == 0) search.score else -search.score
+                  if (search.isWin(s)) {
+                      val who = if (s > 0) "светлых" else "тёмных"
+                      return "выигрыш $who через ${(search.pliesToWin(s) + 1) / 2} ход."
+                  }
+                  return String.format("%+.2f", s / 100.0) + " (за светлых)"
+              }
+
+              // 0 = подсказки нет, 1 = показана, 2 = позиция уже изменилась
+              private fun suggest(base: IntArray): Int {
+                  if (pos.moves().isEmpty()) { show("Ходов нет. Партия окончена", null); return 0 }
+                  val sp = getSharedPreferences("s", Context.MODE_PRIVATE)
+                  val both = sp.getBoolean("both", false)
+                  val me = if (lb) 0 else 1
+                  if (!both && pos.side != me) { show("Жду ход соперника…", null); return 0 }
+                  show("Думаю…", null)
+                  val ms = sp.getInt("ms", 5000).coerceIn(1000, 5000)
+                  val m = search.best(pos, ms) ?: run { show("Нет хода", null); return 0 }
+                  val chk = clean()
+                  if (chk != null && cellDiff(base, chk).any { it }) return 2
+                  val name = if (isKing(m.piece)) "Дамка" else "Шашка"
+                  var text = if (m.capSq.isNotEmpty())
+                      name + " бьёт " + Geo.name(m.from) + m.path.joinToString("") { ":" + Geo.name(it) } +
+                          (if (m.capSq.size > 1) " (×${m.capSq.size})" else "")
+                  else name + " " + Geo.name(m.from) + " → " + Geo.name(m.to)
+                  if (m.promo) text += ", в дамки"
+                  val dep = if (search.depth > 0) " · глубина " + search.depth else ""
+                  show(text, m, "Оценка: " + fmtScore() + dep)
+                  return 1
+              }
+
+              // ---------- главный цикл ----------
+              private fun findBoard(forceManual: Boolean): Boolean {
+                  regionReady = false
+                  show("Ищу доску…", null)
+                  val t0 = System.currentTimeMillis()
+                  var manual = false
+                  if (forceManual) { manual = true; H.post { enableManual() } }
+                  while (running && !regionReady) {
+                      if (!manual) {
+                          freshFrame()
+                          val px = fullShot()
+                          showAll()
+                          if (px != null) {
+                              val r = detectBoard(px, fw, fh)
+                              if (r != null) {
+                                  rx = r[0] * SC; ry = r[1] * SC; rs = r[2] * SC
+                                  setBoard()
+                                  regionReady = true
+                                  break
                               }
                           }
-                      }
-                      if (botWhite != botBlack) return botWhite > botBlack
-                      if (botCnt > 0 && topCnt > 0) return (botLumSum / botCnt) >= (topLumSum / topCnt)
-                      return true
-                  } catch (_: Exception) {
-                      return true
-                  }
-              }
-
-              private fun show(msg: String, fromIdx: Int?, toIdx: Int?, sub: String = "") {
-                  var arrow: FloatArray? = null
-                  if (fromIdx != null && toIdx != null && rs > 0) {
-                      val s = rs / boardN.toFloat()
-                      fun pt(idx: Int): PointF {
-                          val file = idx % boardN
-                          val rank = idx / boardN
-                          val col = if (whiteBottom) file else boardN - 1 - file
-                          val row = if (whiteBottom) boardN - 1 - rank else rank
-                          return PointF(rx + (col + 0.5f) * s, ry + (row + 0.5f) * s)
-                      }
-                      val a = pt(fromIdx)
-                      val b = pt(toIdx)
-                      arrow = floatArrayOf(a.x, a.y, b.x, b.y)
-                  }
-                  H.post {
-                      ov?.let {
-                          it.msg = msg; it.sub = sub; it.ar = arrow; it.arrowOn = arrow != null
-                          it.visibility = View.VISIBLE; it.invalidate()
-                      }
-                  }
-              }
-
-              private fun enableManual() {
-                  ov?.let {
-                      it.cal = true
-                      it.msg = "Не нашёл доску. Обведи её по краям"
-                      it.sub = "Потяни от левого верхнего угла к правому нижнему"
-                      it.ar = null
-                      lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                      wm.updateViewLayout(it, lp)
-                      it.visibility = View.VISIBLE; it.invalidate()
-                  }
-              }
-
-              private fun readBoardState(): IntArray? = synchronized(lock) {
-                  val img = held ?: return@synchronized null
-                  if (rs < 64) return@synchronized null
-                  try {
-                      val pl = img.planes[0]
-                      val buf = pl.buffer
-                      val st = pl.rowStride
-                      val ps = pl.pixelStride
-                      val bw = img.width
-                      val bh = img.height
-                      val x0 = rx.coerceIn(0, bw - 1)
-                      val y0 = ry.coerceIn(0, bh - 1)
-                      val s = minOf(rs, bw - x0, bh - y0)
-                      val cell = s / boardN.toFloat()
-
-                      val total = boardN * boardN
-                      val ctrLum = FloatArray(total)
-                      val diffCnt = IntArray(total)
-                      val crownDetail = FloatArray(total)
-
-                      for (r in 0 until boardN) {
-                          for (c in 0 until boardN) {
-                              val i = r * boardN + c
-                              val bx = (x0 + (c + 0.12f) * cell).toInt().coerceIn(0, bw - 1)
-                              val by = (y0 + (r + 0.12f) * cell).toInt().coerceIn(0, bh - 1)
-                              val bo = by * st + bx * ps
-                              val br = buf.get(bo).toInt() and 255
-                              val bg = buf.get(bo + 1).toInt() and 255
-                              val bb = buf.get(bo + 2).toInt() and 255
-
-                              var sumL = 0f; var hits = 0
-                              for (dy in -2..2) for (dx in -2..2) {
-                                  val px = (x0 + (c + 0.5f) * cell + dx * (cell * 0.06f)).toInt().coerceIn(0, bw - 1)
-                                  val py = (y0 + (r + 0.5f) * cell + dy * (cell * 0.06f)).toInt().coerceIn(0, bh - 1)
-                                  val po = py * st + px * ps
-                                  val pr = buf.get(po).toInt() and 255
-                                  val pg = buf.get(po + 1).toInt() and 255
-                                  val pb = buf.get(po + 2).toInt() and 255
-                                  sumL += 0.299f * pr + 0.587f * pg + 0.114f * pb
-                                  if (abs(pr - br) + abs(pg - bg) + abs(pb - bb) > 46) hits++
-                              }
-                              ctrLum[i] = sumL / 25f
-                              diffCnt[i] = hits
-
-                              val gN = 7
-                              val lumGrid = FloatArray(gN * gN)
-                              for (gy in 0 until gN) {
-                                  val fy = 0.28f + 0.44f * (gy / (gN - 1f))
-                                  for (gx in 0 until gN) {
-                                      val fx = 0.28f + 0.44f * (gx / (gN - 1f))
-                                      val xx = (x0 + (c + fx) * cell).toInt().coerceIn(0, bw - 1)
-                                      val yy = (y0 + (r + fy) * cell).toInt().coerceIn(0, bh - 1)
-                                      val po = yy * st + xx * ps
-                                      val pr = buf.get(po).toInt() and 255
-                                      val pg = buf.get(po + 1).toInt() and 255
-                                      val pb = buf.get(po + 2).toInt() and 255
-                                      lumGrid[gy * gN + gx] = 0.299f * pr + 0.587f * pg + 0.114f * pb
-                                  }
-                              }
-                              var gradSum = 0f; var gradPairs = 0
-                              for (gy in 0 until gN) for (gx in 0 until gN) {
-                                  val v0 = lumGrid[gy * gN + gx]
-                                  if (gx + 1 < gN) { gradSum += abs(v0 - lumGrid[gy * gN + gx + 1]); gradPairs++ }
-                                  if (gy + 1 < gN) { gradSum += abs(v0 - lumGrid[(gy + 1) * gN + gx]); gradPairs++ }
-                              }
-                              crownDetail[i] = if (gradPairs > 0) gradSum / gradPairs else 0f
+                          if (System.currentTimeMillis() - t0 > 5000) {
+                              manual = true
+                              H.post { enableManual() }
                           }
                       }
+                      Thread.sleep(250)
+                  }
+                  return running
+              }
 
-                      val occDetails = ArrayList<Float>()
-                      for (i in 0 until total) if (diffCnt[i] >= 6) occDetails.add(crownDetail[i])
-                      occDetails.sort()
-                      val kingThr = if (occDetails.size >= 4) {
-                          val p75 = occDetails[(occDetails.size * 3) / 4]
-                          val p50 = occDetails[occDetails.size / 2]
-                          max(14f, p50 + (p75 - p50) * 1.15f)
+              // true = нужно заново искать доску
+              private fun session(): Boolean {
+                  show("Доска найдена. Читаю позицию…", null)
+                  Thread.sleep(150)
+                  resetSync()
+                  var badSince = 0L
+                  var cf: IntArray? = null
+                  val baseX = rx
+                  val baseY = ry
+                  var failSince = System.currentTimeMillis()
+                  var shiftIdx = -1
+                  while (running && !recalReq) {
+                      val f = clean()
+                      if (f == null) { Thread.sleep(200); continue }
+                      val cells = cellsInfo(f)
+                      val thr = lumThr(cells)
+                      var n = 0
+                      for (c in cells) if (c.occ) n++
+                      val now = System.currentTimeMillis()
+                      if (n > 24 || n < 1) {
+                          if (badSince == 0L) badSince = now
+                          if (now - badSince > 2500) return true
+                          show("Проверяю границы доски…", null, "шашек: $n")
+                          Thread.sleep(300)
+                          continue
+                      }
+                      badSince = 0L
+                      if (establish(cells, thr)) { cf = f; break }
+                      dbg = "шашек: $n, на светлых полях: ${wrongCells(cells)}"
+                      if (shiftIdx >= 0) dbg += " · сдвиг " + (shiftIdx + 1)
+                      if (now - failSince > 1800) {
+                          failSince = now
+                          shiftIdx++
+                          rx = baseX
+                          ry = baseY
+                          if (shiftIdx >= SHIFTS.size) { setBoard(); return true }
+                          val st = rs / 8
+                          val nx = baseX + SHIFTS[shiftIdx][0] * st
+                          val ny = baseY + SHIFTS[shiftIdx][1] * st
+                          if (nx >= 0 && ny >= 0 && nx + rs <= fw * SC && ny + rs <= fh * SC) { rx = nx; ry = ny }
+                          setBoard()
+                      }
+                      show(noticeMsg(), null, dbg)
+                      Thread.sleep(400)
+                  }
+                  if (!running) return false
+                  if (recalReq || cf == null) return true
+                  var st = try { suggest(cf) } catch (ex: Exception) { needSync = true; -1 }
+                  waitFrame()
+                  var ref: IntArray? = if (st == 2) cf else grab()
+                  var seen = seq
+                  var unstable = false
+                  var lastIdle = System.currentTimeMillis()
+                  badSince = 0L
+                  while (running && !recalReq) {
+                      val now = System.currentTimeMillis()
+                      val forced = (needSync && now - lastSyncTry > 700) || (unstable && now - lastIdle > 400)
+                      if (!forced && seq == seen) { Thread.sleep(30); continue }
+                      seen = seq
+                      lastSyncTry = now
+                      val a = grab() ?: continue
+                      Thread.sleep(90)
+                      val b = grab() ?: continue
+                      if (cellDiff(a, b).any { it }) { unstable = true; lastIdle = System.currentTimeMillis(); continue }
+                      unstable = false
+                      if (!forced) {
+                          val r0 = ref ?: b
+                          if (!cellDiff(r0, b).any { it }) continue
+                      }
+                      val wasSync = needSync
+                      val f = (if (needSync) grab() else clean(false)) ?: continue
+                      val res = try { process(f) } catch (ex: Exception) { needSync = true; 0 }
+                      if (badGrid) {
+                          if (badSince == 0L) badSince = now else if (now - badSince > 2500) return true
+                      } else badSince = 0L
+                      if (res == 1 || (wasSync && !needSync)) {
+                          st = try { suggest(f) } catch (ex: Exception) { needSync = true; unmatchedSince = 0L; -1 }
                       } else {
-                          26f
+                          if (needSync) show(noticeMsg(), null, dbg) else reShow()
+                          st = -1
                       }
-
-                      val state = IntArray(total)
-                      for (r in 0 until boardN) {
-                          for (c in 0 until boardN) {
-                              val viewIdx = r * boardN + c
-                              if (diffCnt[viewIdx] >= 6) {
-                                  val isWhite = ctrLum[viewIdx] >= 135f
-                                  val isKing = crownDetail[viewIdx] >= kingThr
-                                  val boardIdx = if (whiteBottom) (boardN - 1 - r) * boardN + c else r * boardN + (boardN - 1 - c)
-                                  state[boardIdx] = when {
-                                      isWhite && isKing -> 2
-                                      isWhite -> 1
-                                      isKing -> 4
-                                      else -> 3
-                                  }
-                              }
-                          }
-                      }
-                      state
-                  } catch (_: Exception) { null }
-              }
-
-              private fun matchMove(observed: IntArray): MoveStep? {
-                  val moves = board.legalMoves(mandatoryCapture = true)
-                  var bestMove: MoveStep? = null
-                  var bestScore = Int.MAX_VALUE
-                  for (m in moves) {
-                      val copy = board.copy()
-                      copy.applyMove(m)
-                      var sideDiff = 0
-                      var kingDiff = 0
-                      for (i in observed.indices) {
-                          val exp = copy.cells[i]
-                          val obs = observed[i]
-                          val expSide = when (exp) { 1, 2 -> 1; 3, 4 -> 2; else -> 0 }
-                          val obsSide = when (obs) { 1, 2 -> 1; 3, 4 -> 2; else -> 0 }
-                          if (expSide != obsSide) sideDiff++
-                          if (exp != obs) kingDiff++
-                      }
-                      if (sideDiff == 0) {
-                          if (kingDiff < bestScore) {
-                              bestScore = kingDiff
-                              bestMove = m
-                          }
-                      }
+                      waitFrame()
+                      ref = if (st == 2) f else grab()
+                      seen = seq
                   }
-                  return bestMove
+                  return recalReq
               }
 
               private fun loop() {
                   try {
-                      val lib = applicationInfo.nativeLibraryDir + "/libcheckers.so"
-                      val e = CheckersEngine(lib)
-                      eng = e
-                      board.reset()
-
+                      load()
+                      pos = newPos()
+                      pos.setStart()
                       var manual = false
                       while (running) {
-                          show("Ищу доску…", null, null)
-                          val t0 = System.currentTimeMillis()
-                          var found = false
-                          if (!manual) {
-                              while (running && System.currentTimeMillis() - t0 < 4000) {
-                                  if (autoFindBoard()) { found = true; break }
-                                  Thread.sleep(250)
-                              }
-                          }
-                          if (!found && running) {
-                              regionReady = false
-                              H.post { enableManual() }
-                              while (running && !regionReady && !recalReq) Thread.sleep(200)
-                              manual = false
-                          }
+                          if (!findBoard(manual)) return
+                          session()
                           if (!running) return
-
-                          whiteBottom = detectWhiteBottom()
-                          val sideLabel = if (whiteBottom) "белые снизу" else "чёрные снизу"
-                          show("Доска найдена ($sideLabel)", null, null)
-                          Thread.sleep(250)
-
-                          var lastSeq = -1L
-                          var needReSearch = false
-                          while (running && !recalReq && !needReSearch) {
-                              val curSeq = seq
-                              if (curSeq == lastSeq) { Thread.sleep(150); continue }
-                              lastSeq = curSeq
-
-                              val observed = readBoardState() ?: continue
-                              val nonEmpty = observed.count { it != 0 }
-                              if (nonEmpty < 2 || nonEmpty > boardN * boardN) {
-                                  needReSearch = true
-                                  break
-                              }
-
-                              matchMove(observed)?.let { board.applyMove(it) }
-
-                              val sp = getSharedPreferences("s", Context.MODE_PRIVATE)
-                              val both = sp.getBoolean("both", false)
-                              val myWhite = whiteBottom
-                              if (!both && board.whiteTurn != myWhite) {
-                                  show("Жду ход соперника… ($sideLabel)", null, null)
-                                  continue
-                              }
-                              val ms = sp.getInt("ms", 3000).coerceIn(1000, 5000)
-                              val sign = if (board.whiteTurn) 1 else -1
-                              val uci = e.best(board.toFen(), ms, sign)
-                              val step = board.uciToMove(uci, mandatoryCapture = true)
-                              if (step != null) {
-                                  val capNote = if (step.captures.isNotEmpty()) " (взятие: ${step.captures.size})" else ""
-                                  show(
-                                      "${board.coordName(step.from)} → ${board.coordName(step.to)}$capNote",
-                                      step.from, step.to,
-                                      "Оценка: ${e.score} · глубина ${e.depth} · $sideLabel"
-                                  )
-                              } else {
-                                  show("Ход: $uci", null, null, sideLabel)
-                              }
-                          }
-                          if (recalReq) {
-                              recalReq = false
-                              manual = true
-                          }
+                          manual = recalReq
+                          recalReq = false
                       }
                   } catch (ex: Exception) {
-                      show("Ошибка: ${ex.message}", null, null)
+                      show("Ошибка: " + ex.message, null)
                   }
               }
 
               override fun onDestroy() {
                   running = false
-                  ov?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  eng?.quit()
+                  ov?.let { try { wm.removeView(it) } catch (e: Exception) {} }
                   proj?.stop()
-                  synchronized(lock) { try { held?.close() } catch (_: Exception) {}; held = null }
+                  synchronized(lock) { try { held?.close() } catch (e: Exception) {}; held = null }
                   imgThread?.quitSafely()
-                  try { reader?.close() } catch (_: Exception) {}
+                  try { reader?.close() } catch (e: Exception) {}
                   super.onDestroy()
               }
           }
