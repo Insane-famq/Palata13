@@ -1,0 +1,1274 @@
+name: Build Checkers APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Install NDK and SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;27.0.12077973" "platforms;android-35" "build-tools;35.0.0"
+      - name: Build Fairy-Stockfish (arm64-v8a)
+        run: |
+          mkdir -p /tmp/checkers-eng app/src/main/jniLibs/arm64-v8a
+          git clone --depth 1 https://github.com/fairy-stockfish/Fairy-Stockfish.git /tmp/checkers-eng/src
+          NDK_ROOT="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/27.0.12077973}"
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          make -C /tmp/checkers-eng/src -j"$(nproc)" \
+            build ARCH=armv8 COMP=clang \
+            CXX="$TOOLCHAIN/aarch64-linux-android26-clang++" \
+            LD="$TOOLCHAIN/aarch64-linux-android26-clang++" \
+            STRIP="$TOOLCHAIN/llvm-strip"
+          cp /tmp/checkers-eng/src/stockfish app/src/main/jniLibs/arm64-v8a/libcheckers.so
+          "$TOOLCHAIN/llvm-strip" app/src/main/jniLibs/arm64-v8a/libcheckers.so || true
+          ls -lh app/src/main/jniLibs/arm64-v8a/libcheckers.so
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/helper/checkers
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "CheckersHelper"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx3g" > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.helper.checkers"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.helper.checkers"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters.add("arm64-v8a") }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                      keepDebugSymbols.add("**/*.so")
+                  }
+              }
+          }
+          dependencies {
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="Шашечный помощник"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".CaptureService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/helper/checkers/DraughtsBoard.kt <<'EOF'
+          package com.helper.checkers
+
+          // 0 = пусто
+          // 1 = белая шашка, 2 = белая дамка
+          // 3 = чёрная шашка, 4 = чёрная дамка
+          data class MoveStep(val from: Int, val to: Int, val captures: List<Int> = emptyList())
+
+          class DraughtsBoard(val size: Int = 8) {
+              val cells = IntArray(size * size)
+              var whiteTurn: Boolean = true
+
+              init { reset() }
+
+              fun reset() {
+                  cells.fill(0)
+                  whiteTurn = true
+                  val rowsPerSide = if (size >= 10) 4 else 3
+                  for (r in 0 until size) {
+                      for (c in 0 until size) {
+                          if ((r + c) % 2 == 0) {
+                              if (r < rowsPerSide) cells[r * size + c] = 1
+                              else if (r >= size - rowsPerSide) cells[r * size + c] = 3
+                          }
+                      }
+                  }
+              }
+
+              fun copy(): DraughtsBoard {
+                  val b = DraughtsBoard(size)
+                  System.arraycopy(cells, 0, b.cells, 0, cells.size)
+                  b.whiteTurn = whiteTurn
+                  return b
+              }
+
+              private fun inBounds(r: Int, c: Int) = r in 0 until size && c in 0 until size
+              private fun idx(r: Int, c: Int) = r * size + c
+              private fun isWhite(p: Int) = p == 1 || p == 2
+              private fun isBlack(p: Int) = p == 3 || p == 4
+              private fun isKing(p: Int) = p == 2 || p == 4
+              private fun isOwn(p: Int, w: Boolean) = if (w) isWhite(p) else isBlack(p)
+              private fun isEnemy(p: Int, w: Boolean) = if (w) isBlack(p) else isWhite(p)
+              private fun promotionRow(w: Boolean) = if (w) size - 1 else 0
+              private fun promotePiece(piece: Int, row: Int, w: Boolean): Int {
+                  if (row != promotionRow(w)) return piece
+                  return when (piece) {
+                      1 -> 2
+                      3 -> 4
+                      else -> piece
+                  }
+              }
+
+              fun legalMoves(mandatoryCapture: Boolean = true): List<MoveStep> {
+                  val w = whiteTurn
+                  val captures = ArrayList<MoveStep>()
+                  val quiets = ArrayList<MoveStep>()
+                  val dirs = arrayOf(intArrayOf(1, 1), intArrayOf(1, -1), intArrayOf(-1, 1), intArrayOf(-1, -1))
+
+                  fun dfsCaptures(
+                      curPos: Int,
+                      piece: Int,
+                      visitedCaptured: Set<Int>,
+                      pathFrom: Int,
+                      accCaptures: MutableList<Int>,
+                      out: MutableList<MoveStep>
+                  ) {
+                      var extended = false
+                      val r0 = curPos / size
+                      val c0 = curPos % size
+                      val activePiece = promotePiece(piece, r0, w)
+                      val king = isKing(activePiece)
+
+                      for (d in dirs) {
+                          if (!king) {
+                              val r1 = r0 + d[0]
+                              val c1 = c0 + d[1]
+                              val r2 = r0 + 2 * d[0]
+                              val c2 = c0 + 2 * d[1]
+                              if (inBounds(r2, c2)) {
+                                  val mid = idx(r1, c1)
+                                  val dst = idx(r2, c2)
+                                  if (mid !in visitedCaptured && isEnemy(cells[mid], w) && cells[dst] == 0) {
+                                      extended = true
+                                      val nextVisited = visitedCaptured + mid
+                                      val nextCaps = ArrayList(accCaptures).apply { add(mid) }
+                                      val afterLandPiece = promotePiece(activePiece, r2, w)
+                                      dfsCaptures(dst, afterLandPiece, nextVisited, pathFrom, nextCaps, out)
+                                  }
+                              }
+                          } else {
+                              var step = 1
+                              while (true) {
+                                  val rm = r0 + step * d[0]
+                                  val cm = c0 + step * d[1]
+                                  if (!inBounds(rm, cm)) break
+                                  val mid = idx(rm, cm)
+                                  if (mid in visitedCaptured) {
+                                      step++
+                                      continue
+                                  }
+                                  val pm = cells[mid]
+                                  if (pm != 0) {
+                                      if (isOwn(pm, w)) break
+                                      var land = step + 1
+                                      while (true) {
+                                          val rl = r0 + land * d[0]
+                                          val cl = c0 + land * d[1]
+                                          if (!inBounds(rl, cl)) break
+                                          val dst = idx(rl, cl)
+                                          if (cells[dst] != 0) break
+                                          extended = true
+                                          val nextVisited = visitedCaptured + mid
+                                          val nextCaps = ArrayList(accCaptures).apply { add(mid) }
+                                          dfsCaptures(dst, activePiece, nextVisited, pathFrom, nextCaps, out)
+                                          land++
+                                      }
+                                      break
+                                  }
+                                  step++
+                              }
+                          }
+                      }
+
+                      if (!extended && accCaptures.isNotEmpty()) {
+                          out.add(MoveStep(pathFrom, curPos, accCaptures))
+                      }
+                  }
+
+                  for (i in cells.indices) {
+                      val p = cells[i]
+                      if (!isOwn(p, w)) continue
+                      dfsCaptures(i, p, emptySet(), i, ArrayList(), captures)
+                  }
+
+                  if (mandatoryCapture && captures.isNotEmpty()) {
+                      return captures
+                  }
+                  if (captures.isNotEmpty()) return captures
+
+                  for (i in cells.indices) {
+                      val p = cells[i]
+                      if (!isOwn(p, w)) continue
+                      val r0 = i / size
+                      val c0 = i % size
+                      if (!isKing(p)) {
+                          val dr = if (w) 1 else -1
+                          for (dc in intArrayOf(-1, 1)) {
+                              val r1 = r0 + dr
+                              val c1 = c0 + dc
+                              if (inBounds(r1, c1) && cells[idx(r1, c1)] == 0) {
+                                  quiets.add(MoveStep(i, idx(r1, c1)))
+                              }
+                          }
+                      } else {
+                          for (d in dirs) {
+                              var step = 1
+                              while (true) {
+                                  val r1 = r0 + step * d[0]
+                                  val c1 = c0 + step * d[1]
+                                  if (!inBounds(r1, c1)) break
+                                  if (cells[idx(r1, c1)] != 0) break
+                                  quiets.add(MoveStep(i, idx(r1, c1)))
+                                  step++
+                              }
+                          }
+                      }
+                  }
+                  return quiets
+              }
+
+              fun applyMove(m: MoveStep) {
+                  val p = cells[m.from]
+                  cells[m.from] = 0
+                  for (cap in m.captures) cells[cap] = 0
+                  val rTo = m.to / size
+                  val newP = promotePiece(p, rTo, whiteTurn)
+                  cells[m.to] = newP
+                  whiteTurn = !whiteTurn
+              }
+
+              fun coordName(i: Int): String {
+                  val file = ('a' + (i % size))
+                  val rank = (i / size) + 1
+                  return "$file$rank"
+              }
+
+              fun parseCoord(s: String): Int {
+                  if (s.length < 2) return -1
+                  val c = s[0].lowercaseChar() - 'a'
+                  val r = s.substring(1).toIntOrNull()?.minus(1) ?: return -1
+                  if (!inBounds(r, c)) return -1
+                  return idx(r, c)
+              }
+
+              fun uciToMove(uci: String, mandatoryCapture: Boolean = true): MoveStep? {
+                  if (uci.length < 4) return null
+                  val from = parseCoord(uci.substring(0, 2))
+                  val to = parseCoord(uci.substring(uci.length - 2))
+                  if (from < 0 || to < 0) return null
+                  val moves = legalMoves(mandatoryCapture)
+                  return moves.firstOrNull { it.from == from && it.to == to }
+                      ?: moves.firstOrNull { it.from == from }
+              }
+
+              fun toFen(): String {
+                  val sb = StringBuilder()
+                  for (r in size - 1 downTo 0) {
+                      var empty = 0
+                      for (c in 0 until size) {
+                          val ch = when (cells[r * size + c]) {
+                              1 -> 'P'
+                              2 -> 'K'
+                              3 -> 'p'
+                              4 -> 'k'
+                              else -> '.'
+                          }
+                          if (ch == '.') {
+                              empty++
+                          } else {
+                              if (empty > 0) { sb.append(empty); empty = 0 }
+                              sb.append(ch)
+                          }
+                      }
+                      if (empty > 0) sb.append(empty)
+                      if (r > 0) sb.append('/')
+                  }
+                  val turn = if (whiteTurn) "w" else "b"
+                  return "$sb $turn - - 0 1"
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/helper/checkers/MainActivity.kt <<'EOF'
+          package com.helper.checkers
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private fun btn(text: String, color: Int): Button {
+                  val b = Button(this)
+                  b.text = text
+                  b.setTextColor(Color.WHITE)
+                  b.textSize = 17f
+                  b.isAllCaps = false
+                  val g = GradientDrawable()
+                  g.setColor(color)
+                  g.cornerRadius = 48f
+                  b.background = g
+                  val lp = LinearLayout.LayoutParams(-1, 150)
+                  lp.topMargin = 28
+                  b.layoutParams = lp
+                  return b
+              }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val prefs = getSharedPreferences("s", Context.MODE_PRIVATE)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 2)
+                  }
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(56, 110, 56, 56)
+
+                  val title = TextView(this)
+                  title.text = "⛂ Шашечный помощник"
+                  title.textSize = 28f
+                  title.setTextColor(Color.WHITE)
+                  title.gravity = Gravity.CENTER
+                  root.addView(title)
+
+                  val sub = TextView(this)
+                  sub.text = "Подсказка ходов в реальном времени поверх доски"
+                  sub.textSize = 14f
+                  sub.setTextColor(0xFF8B98A5.toInt())
+                  sub.gravity = Gravity.CENTER
+                  sub.setPadding(0, 12, 0, 40)
+                  root.addView(sub)
+
+                  val steps = TextView(this)
+                  steps.text = "1. Открой приложение с шашками\n" +
+                      "2. Вернись сюда и нажми «Запустить»\n" +
+                      "3. Выдай доступ к экрану и оверлею\n" +
+                      "4. Доска найдётся сама; если нет — обведи её по краям"
+                  steps.textSize = 15f
+                  steps.setTextColor(0xFFD0D7DE.toInt())
+                  steps.setLineSpacing(8f, 1f)
+                  val card = GradientDrawable()
+                  card.setColor(0xFF1A2129.toInt())
+                  card.cornerRadius = 36f
+                  steps.background = card
+                  steps.setPadding(40, 36, 40, 36)
+                  root.addView(steps)
+
+                  val tl = TextView(this)
+                  tl.textSize = 16f
+                  tl.setTextColor(Color.WHITE)
+                  tl.setPadding(0, 44, 0, 8)
+                  root.addView(tl)
+                  val sb = SeekBar(this)
+                  sb.max = 4
+                  val cur = prefs.getInt("ms", 3000)
+                  sb.progress = (cur / 1000 - 1).coerceIn(0, 4)
+                  fun upd(sec: Int) { tl.text = "Макс. время на ход: $sec с" }
+                  upd(sb.progress + 1)
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(x: SeekBar?, p: Int, u: Boolean) {
+                          upd(p + 1)
+                          prefs.edit().putInt("ms", (p + 1) * 1000).apply()
+                      }
+                      override fun onStartTrackingTouch(x: SeekBar?) {}
+                      override fun onStopTrackingTouch(x: SeekBar?) {}
+                  })
+                  root.addView(sb)
+
+                  val both = CheckBox(this)
+                  both.text = "Подсказывать за обе стороны"
+                  both.setTextColor(Color.WHITE)
+                  both.textSize = 15f
+                  both.setPadding(0, 24, 0, 0)
+                  both.isChecked = prefs.getBoolean("both", false)
+                  both.setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean("both", v).apply() }
+                  root.addView(both)
+
+                  val go = btn("▶  Запустить", 0xFF2E9E5B.toInt())
+                  val stop = btn("■  Остановить", 0xFFB23B3B.toInt())
+                  val recal = btn("Указать доску вручную", 0xFF2A3440.toInt())
+                  root.addView(go); root.addView(stop); root.addView(recal)
+
+                  val sv = ScrollView(this)
+                  sv.isFillViewport = true
+                  sv.setBackgroundColor(0xFF0F1419.toInt())
+                  sv.addView(root)
+                  sv.setOnApplyWindowInsetsListener { _, ins ->
+                      root.setPadding(56, ins.systemWindowInsetTop + 48, 56, ins.systemWindowInsetBottom + 48)
+                      ins
+                  }
+                  setContentView(sv)
+
+                  go.setOnClickListener {
+                      if (!Settings.canDrawOverlays(this)) {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                          Toast.makeText(this, "Разреши «Поверх других приложений» и нажми снова", Toast.LENGTH_LONG).show()
+                      } else {
+                          val m = getSystemService(MediaProjectionManager::class.java)
+                          startActivityForResult(m.createScreenCaptureIntent(), 1)
+                      }
+                  }
+                  stop.setOnClickListener { stopService(Intent(this, CaptureService::class.java)) }
+                  recal.setOnClickListener {
+                      startService(Intent(this, CaptureService::class.java).setAction("recal"))
+                      Toast.makeText(this, "Вернись в игру и обведи доску по краям", Toast.LENGTH_SHORT).show()
+                      moveTaskToBack(true)
+                  }
+              }
+
+              @Deprecated("old api")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (res == RESULT_OK && data != null) {
+                      val i = Intent(this, CaptureService::class.java)
+                          .putExtra("code", res).putExtra("data", data)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/helper/checkers/CaptureService.kt <<'EOF'
+          package com.helper.checkers
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.hardware.display.DisplayManager
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.util.DisplayMetrics
+          import android.view.*
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sqrt
+
+          class CheckersEngine(path: String) {
+              private val p = ProcessBuilder(path).redirectErrorStream(true).start()
+              private val w = p.outputStream.bufferedWriter()
+              private val r = p.inputStream.bufferedReader()
+              var score = ""
+              var depth = 0
+              var activeVariant = "chess"
+
+              init {
+                  val uciLines = ArrayList<String>()
+                  send("uci")
+                  while (true) {
+                      val l = r.readLine() ?: break
+                      uciLines.add(l)
+                      if (l.startsWith("uciok")) break
+                  }
+                  if (uciLines.none { it.startsWith("uciok") }) {
+                      p.destroy()
+                      throw RuntimeException("engine")
+                  }
+                  val variantsLine = uciLines.firstOrNull { it.startsWith("option name UCI_Variant ") }
+                  val candidates = listOf("russian", "draughts", "brazilian", "english", "frisian")
+                  val chosen = candidates.firstOrNull { v ->
+                      variantsLine?.contains("var $v", ignoreCase = true) == true
+                  } ?: "draughts"
+                  send("setoption name UCI_Variant value $chosen")
+                  activeVariant = chosen
+                  send("setoption name Hash value 64")
+                  send("isready")
+                  waitFor("readyok")
+              }
+
+              private fun send(s: String) { w.write(s + "\n"); w.flush() }
+              private fun waitFor(t: String): Boolean {
+                  while (true) { val l = r.readLine() ?: return false; if (l.startsWith(t)) return true }
+              }
+
+              fun best(fen: String, ms: Int, sign: Int): String {
+                  send("position fen $fen")
+                  send("go movetime $ms")
+                  score = ""; depth = 0
+                  val t0 = System.currentTimeMillis()
+                  val reS = Regex("score (cp|mate) (-?\\d+)")
+                  val reD = Regex(" depth (\\d+)")
+                  while (true) {
+                      val l = r.readLine() ?: return ""
+                      if (System.currentTimeMillis() - t0 > ms + 2500) { send("stop") }
+                      if (l.startsWith("info")) {
+                          reS.find(l)?.let { m ->
+                              val raw = m.groupValues[2].toInt() * sign
+                              score = if (m.groupValues[1] == "mate") "мат ${if (raw >= 0) "+" else ""}$raw"
+                              else String.format("%+.2f", raw / 100.0)
+                          }
+                          reD.find(l)?.groupValues?.get(1)?.toIntOrNull()?.let { if (it > 0) depth = it }
+                      }
+                      if (l.startsWith("bestmove")) return l.split(" ").getOrElse(1) { "" }
+                  }
+              }
+
+              fun quit() { try { send("quit") } catch (_: Exception) {}; p.destroy() }
+          }
+
+          class Overlay(c: Context) : View(c) {
+              var cal = false
+              var arrowOn = false
+              var onRegion: (Int, Int, Int) -> Unit = { _, _, _ -> }
+              private val a = PointF()
+              private val b = PointF()
+              private var drag = false
+              var msg = "Ищу доску…"
+              var sub = ""
+              var ar: FloatArray? = null
+              var boardX = 0
+              var boardY = 0
+              var boardS = 0
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (!cal) return false
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> { a.set(e.x, e.y); b.set(e.x, e.y); drag = true }
+                      MotionEvent.ACTION_MOVE -> b.set(e.x, e.y)
+                      MotionEvent.ACTION_CANCEL -> drag = false
+                      MotionEvent.ACTION_UP -> {
+                          drag = false
+                          val s = ((abs(b.x - a.x) + abs(b.y - a.y)) / 2).toInt()
+                          if (s > 150) {
+                              cal = false
+                              msg = "Читаю позицию…"
+                              sub = ""
+                              onRegion(min(a.x, b.x).toInt(), min(a.y, b.y).toInt(), s)
+                          }
+                      }
+                  }
+                  invalidate()
+                  return true
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  if (cal) {
+                      p.style = Paint.Style.FILL; p.color = 0x55000000
+                      cv.drawRect(0f, 0f, width.toFloat(), height.toFloat(), p)
+                      if (drag) {
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 6f; p.color = 0xFF00FF00.toInt()
+                          cv.drawRect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y), p)
+                      }
+                  }
+                  if (boardS > 0) {
+                      p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = 0xAAFFEB3B.toInt()
+                      cv.drawRect(boardX.toFloat(), boardY.toFloat(), (boardX + boardS).toFloat(), (boardY + boardS).toFloat(), p)
+                  }
+                  val arr = ar
+                  if (arrowOn && arr != null) {
+                      val dx = arr[2] - arr[0]
+                      val dy = arr[3] - arr[1]
+                      val len = sqrt(dx * dx + dy * dy)
+                      if (len > 1f) {
+                          val ux = dx / len
+                          val uy = dy / len
+                          val hx = arr[2] - ux * 44f
+                          val hy = arr[3] - uy * 44f
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 18f; p.strokeCap = Paint.Cap.ROUND
+                          p.color = 0xE600C853.toInt()
+                          cv.drawLine(arr[0], arr[1], hx, hy, p)
+                          p.style = Paint.Style.FILL
+                          val pa = Path()
+                          pa.moveTo(arr[2], arr[3])
+                          pa.lineTo(hx - uy * 36f, hy + ux * 36f)
+                          pa.lineTo(hx + uy * 36f, hy - ux * 36f)
+                          pa.close()
+                          cv.drawPath(pa, p)
+                      }
+                  }
+                  p.style = Paint.Style.FILL
+                  val ph = if (sub.isEmpty()) 84f else 132f
+                  val top = 90f
+                  p.textSize = 44f
+                  val w1 = p.measureText(msg)
+                  p.textSize = 32f
+                  val w2 = p.measureText(sub)
+                  val w = max(w1, w2) + 48f
+                  p.color = 0xE6101418.toInt()
+                  cv.drawRoundRect(20f, top, 20f + w, top + ph, 26f, 26f, p)
+                  p.color = Color.WHITE; p.textSize = 44f
+                  cv.drawText(msg, 44f, top + 58f, p)
+                  if (sub.isNotEmpty()) {
+                      p.color = 0xFF7EE29A.toInt(); p.textSize = 32f
+                      cv.drawText(sub, 44f, top + 108f, p)
+                  }
+              }
+          }
+
+          class CaptureService : Service() {
+              private val H = Handler(Looper.getMainLooper())
+              private val boardN = 8
+              private val sc = 2
+              private var proj: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var imgThread: HandlerThread? = null
+              private val lock = Any()
+              private var held: Image? = null
+              @Volatile private var seq = 0L
+              private lateinit var wm: WindowManager
+              private lateinit var lp: WindowManager.LayoutParams
+              private var ov: Overlay? = null
+              private var eng: CheckersEngine? = null
+              private var rx = 0
+              private var ry = 0
+              private var rs = 0
+              private var fw = 0
+              private var fh = 0
+              @Volatile private var running = false
+              @Volatile private var regionReady = false
+              @Volatile private var recalReq = false
+              private var board = DraughtsBoard(boardN)
+              private var whiteBottom = true
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i == null) { stopSelf(); return START_NOT_STICKY }
+                  if (i.action == "recal") {
+                      if (proj != null) recalReq = true else stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (proj != null) return START_NOT_STICKY
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("c", "Шашечный помощник", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "c")
+                      .setContentTitle("Шашечный помощник работает")
+                      .setSmallIcon(android.R.drawable.ic_menu_view).build()
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+
+                  val data = i.getParcelableExtra<Intent>("data") ?: run { stopSelf(); return START_NOT_STICKY }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  val pr = mpm.getMediaProjection(i.getIntExtra("code", 0), data)
+                  pr.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { stopSelf() }
+                  }, H)
+                  proj = pr
+
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val dm = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  val rd = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 3)
+                  reader = rd
+                  val ht = HandlerThread("img")
+                  ht.start()
+                  imgThread = ht
+                  rd.setOnImageAvailableListener({ r ->
+                      val im = try { r.acquireLatestImage() } catch (_: Exception) { null }
+                      if (im != null) {
+                          synchronized(lock) { held?.close(); held = im; seq++ }
+                      }
+                  }, Handler(ht.looper))
+                  pr.createVirtualDisplay("cap", dm.widthPixels, dm.heightPixels, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null)
+
+                  lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                      PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  if (Build.VERSION.SDK_INT >= 28)
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+
+                  val o = Overlay(this)
+                  o.onRegion = { x, y, s ->
+                      rx = x; ry = y; rs = s
+                      H.post {
+                          lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          wm.updateViewLayout(o, lp)
+                          o.boardX = rx; o.boardY = ry; o.boardS = rs; o.invalidate()
+                      }
+                      regionReady = true
+                  }
+                  ov = o
+                  wm.addView(o, lp)
+                  running = true
+                  Thread { loop() }.start()
+                  return START_NOT_STICKY
+              }
+
+              private fun hideOverlay() { H.post { ov?.visibility = View.INVISIBLE } }
+              private fun showOverlay() { H.post { ov?.visibility = View.VISIBLE } }
+
+              private fun freshFrame() {
+                  val s0 = seq
+                  hideOverlay()
+                  val t = System.currentTimeMillis()
+                  while (seq == s0 && System.currentTimeMillis() - t < 350) Thread.sleep(10)
+                  Thread.sleep(90)
+              }
+
+              private fun cd(a: Int, b: Int): Int =
+                  abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
+                      abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
+                      abs((a and 255) - (b and 255))
+
+              private fun fullShot(): IntArray? = synchronized(lock) {
+                  val img = held ?: return@synchronized null
+                  try {
+                      val pl = img.planes[0]
+                      val buf = pl.buffer
+                      val st = pl.rowStride
+                      val ps = pl.pixelStride
+                      val sw = img.width / sc
+                      val sh = img.height / sc
+                      val out = IntArray(sw * sh)
+                      for (y in 0 until sh) {
+                          for (x in 0 until sw) {
+                              var r = 0; var g = 0; var b = 0
+                              for (dy in 0..1) for (dx in 0..1) {
+                                  val o = (y * sc + dy) * st + (x * sc + dx) * ps
+                                  r += buf.get(o).toInt() and 255
+                                  g += buf.get(o + 1).toInt() and 255
+                                  b += buf.get(o + 2).toInt() and 255
+                              }
+                              out[y * sw + x] = (0xFF shl 24) or ((r / 4) shl 16) or ((g / 4) shl 8) or (b / 4)
+                          }
+                      }
+                      fw = sw; fh = sh
+                      out
+                  } catch (_: Exception) { null }
+              }
+
+              private fun checkerAdapt(px: IntArray, w: Int, h: Int, x0: Float, y0: Float, pit: Float): Int {
+                  if (pit < 4f || x0 < 0f || y0 < 0f || x0 + pit * boardN > w + 1f || y0 + pit * boardN > h + 1f) return 0
+                  val ox = floatArrayOf(0.86f, 0.14f, 0.10f, 0.90f)
+                  val oy = floatArrayOf(0.14f, 0.86f, 0.50f, 0.50f)
+                  val total = boardN * boardN
+                  val cr = IntArray(total); val cg = IntArray(total); val cb = IntArray(total)
+                  val sr = IntArray(4); val sg = IntArray(4); val sb = IntArray(4)
+                  for (r in 0 until boardN) for (c in 0 until boardN) {
+                      for (k in 0..3) {
+                          val xx = (x0 + (c + ox[k]) * pit).toInt().coerceIn(0, w - 1)
+                          val yy = (y0 + (r + oy[k]) * pit).toInt().coerceIn(0, h - 1)
+                          val v = px[yy * w + xx]
+                          sr[k] = (v shr 16) and 255
+                          sg[k] = (v shr 8) and 255
+                          sb[k] = v and 255
+                      }
+                      sr.sort(); sg.sort(); sb.sort()
+                      val i = r * boardN + c
+                      cr[i] = (sr[1] + sr[2]) / 2
+                      cg[i] = (sg[1] + sg[2]) / 2
+                      cb[i] = (sb[1] + sb[2]) / 2
+                  }
+                  val med = IntArray(6)
+                  for (par in 0..1) {
+                      val lr = ArrayList<Int>(); val lg = ArrayList<Int>(); val lb = ArrayList<Int>()
+                      for (i in 0 until total) if (((i / boardN) + (i % boardN)) % 2 == par) {
+                          lr.add(cr[i]); lg.add(cg[i]); lb.add(cb[i])
+                      }
+                      lr.sort(); lg.sort(); lb.sort()
+                      val mid = lr.size / 2
+                      med[par * 3] = lr[mid]; med[par * 3 + 1] = lg[mid]; med[par * 3 + 2] = lb[mid]
+                  }
+                  val cA = (med[0] shl 16) or (med[1] shl 8) or med[2]
+                  val cB = (med[3] shl 16) or (med[4] shl 8) or med[5]
+                  if (cd(cA, cB) < 32) return 0
+                  var ok = 0
+                  for (i in 0 until total) {
+                      val par = ((i / boardN) + (i % boardN)) % 2
+                      val v = (cr[i] shl 16) or (cg[i] shl 8) or cb[i]
+                      val own = if (par == 0) cA else cB
+                      val oth = if (par == 0) cB else cA
+                      val d = cd(v, own)
+                      if (d < 56 && d < cd(v, oth)) ok++
+                  }
+                  return ok
+              }
+
+              private fun smoothMax(a: IntArray, lo: Int, hi: Int): IntArray {
+                  val o = IntArray(a.size)
+                  for (i in lo until hi) {
+                      var m = 0
+                      for (j in max(lo, i - 2)..min(hi - 1, i + 2)) if (a[j] > m) m = a[j]
+                      o[i] = m
+                  }
+                  return o
+              }
+
+              private fun gridCands(prof: IntArray, lo: Int, hi: Int, pMin: Float, pMax: Float, n: Int): List<FloatArray> {
+                  val all = ArrayList<FloatArray>()
+                  var p = pMin
+                  while (p <= pMax) {
+                      var bx = -1; var bsc = 0; var x0 = lo
+                      while (x0 + boardN * p <= hi + 3f) {
+                          var sc = 0; var mn = Int.MAX_VALUE
+                          for (k in 1 until boardN) {
+                              val i = (x0 + k * p + 0.5f).toInt()
+                              val v = if (i in lo until hi) prof[i] else 0
+                              sc += v
+                              if (v < mn) mn = v
+                          }
+                          if (mn > 0 && mn * 16 >= sc && sc > bsc) { bsc = sc; bx = x0 }
+                          x0++
+                      }
+                      if (bx >= 0) all.add(floatArrayOf(bx.toFloat(), p, bsc.toFloat()))
+                      p += 0.25f
+                  }
+                  all.sortByDescending { it[2] }
+                  val out = ArrayList<FloatArray>()
+                  for (c in all) {
+                      val dup = out.any { abs(it[0] - c[0]) < 0.4f * c[1] && abs(it[1] - c[1]) < 2f }
+                      if (!dup) {
+                          out.add(c)
+                          if (out.size >= n) break
+                      }
+                  }
+                  return out
+              }
+
+              private fun detectBoard(px: IntArray, w: Int, h: Int): IntArray? {
+                  if (w < 80 || h < 80) return null
+                  val colE = IntArray(w); val rowE = IntArray(h)
+                  for (y in 0 until h - 2) {
+                      val o = y * w; val o2 = o + 2 * w
+                      for (x in 0 until w - 2) {
+                          val p = px[o + x]
+                          if (cd(p, px[o + x + 2]) > 22) colE[x + 1]++
+                          if (cd(p, px[o2 + x]) > 22) rowE[y + 1]++
+                      }
+                  }
+                  val cm = smoothMax(colE, 0, w)
+                  val rm = smoothMax(rowE, 0, h)
+                  val side = min(w, h)
+                  val pMin = max(8f, 0.25f * side / boardN)
+                  val pMax = side / boardN.toFloat() + 1f
+                  val cc = gridCands(cm, 0, w, pMin, pMax, 8)
+                  val rc = gridCands(rm, 0, h, pMin, pMax, 8)
+                  val minMatch = (boardN * boardN * 0.68f).toInt()
+
+                  var bsc0 = 0; var bx0 = 0f; var by0 = 0f; var bbp = 0f
+                  for (c in cc) for (r in rc) {
+                      if (abs(c[1] - r[1]) > 2.5f) continue
+                      val bp = (c[1] + r[1]) / 2f
+                      for (kx in -2..2) for (ky in -2..2) {
+                          val sx = c[0] + kx * bp
+                          val sy = r[0] + ky * bp
+                          val sc = checkerAdapt(px, w, h, sx, sy, bp)
+                          if (sc > bsc0 || (sc == bsc0 && sc > 0 && bp > bbp)) {
+                              bsc0 = sc; bx0 = sx; by0 = sy; bbp = bp
+                          }
+                      }
+                  }
+                  if (bsc0 < minMatch) return null
+
+                  var best: IntArray? = null; var bsc = 0; var bpit = 0f
+                  for (dp in -4..4) {
+                      val pit = bbp + dp * 0.25f
+                      for (dx in -2..2) for (dy in -2..2) {
+                          val sc = checkerAdapt(px, w, h, bx0 + dx, by0 + dy, pit)
+                          if (sc > bsc || (sc == bsc && sc > 0 && pit > bpit)) {
+                              bsc = sc; bpit = pit
+                              best = intArrayOf((bx0 + dx + 0.5f).toInt(), (by0 + dy + 0.5f).toInt(), (pit * boardN + 0.5f).toInt())
+                          }
+                      }
+                  }
+                  return if (bsc >= minMatch) best else null
+              }
+
+              private fun autoFindBoard(): Boolean {
+                  freshFrame()
+                  val px = fullShot()
+                  showOverlay()
+                  if (px == null) return false
+                  val r = detectBoard(px, fw, fh) ?: return false
+                  rx = r[0] * sc; ry = r[1] * sc; rs = r[2] * sc
+                  H.post {
+                      ov?.let {
+                          it.cal = false
+                          lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          wm.updateViewLayout(it, lp)
+                          it.boardX = rx; it.boardY = ry; it.boardS = rs; it.invalidate()
+                      }
+                  }
+                  return true
+              }
+
+              private fun detectWhiteBottom(): Boolean {
+                  val img = synchronized(lock) { held } ?: return true
+                  if (rs < 64) return true
+                  try {
+                      val pl = img.planes[0]
+                      val buf = pl.buffer
+                      val st = pl.rowStride
+                      val ps = pl.pixelStride
+                      val bw = img.width
+                      val bh = img.height
+                      val x0 = rx.coerceIn(0, bw - 1)
+                      val y0 = ry.coerceIn(0, bh - 1)
+                      val s = minOf(rs, bw - x0, bh - y0)
+                      val cell = s / boardN.toFloat()
+
+                      var botLumSum = 0f; var botCnt = 0
+                      var topLumSum = 0f; var topCnt = 0
+                      var botWhite = 0; var botBlack = 0
+                      val homeRows = if (boardN >= 10) 4 else 3
+
+                      for (r in 0 until boardN) {
+                          for (c in 0 until boardN) {
+                              val bx = (x0 + (c + 0.12f) * cell).toInt().coerceIn(0, bw - 1)
+                              val by = (y0 + (r + 0.12f) * cell).toInt().coerceIn(0, bh - 1)
+                              val bo = by * st + bx * ps
+                              val br = buf.get(bo).toInt() and 255
+                              val bg = buf.get(bo + 1).toInt() and 255
+                              val bb = buf.get(bo + 2).toInt() and 255
+
+                              var sumL = 0f; var hits = 0
+                              for (dy in -2..2) for (dx in -2..2) {
+                                  val px = (x0 + (c + 0.5f) * cell + dx * (cell * 0.06f)).toInt().coerceIn(0, bw - 1)
+                                  val py = (y0 + (r + 0.5f) * cell + dy * (cell * 0.06f)).toInt().coerceIn(0, bh - 1)
+                                  val po = py * st + px * ps
+                                  val pr = buf.get(po).toInt() and 255
+                                  val pg = buf.get(po + 1).toInt() and 255
+                                  val pb = buf.get(po + 2).toInt() and 255
+                                  sumL += 0.299f * pr + 0.587f * pg + 0.114f * pb
+                                  if (abs(pr - br) + abs(pg - bg) + abs(pb - bb) > 46) hits++
+                              }
+                              if (hits < 6) continue
+                              val lum = sumL / 25f
+                              if (r >= boardN / 2) {
+                                  botLumSum += lum; botCnt++
+                              } else {
+                                  topLumSum += lum; topCnt++
+                              }
+                              if (r >= boardN - homeRows) {
+                                  if (lum >= 135f) botWhite++ else botBlack++
+                              }
+                          }
+                      }
+                      if (botWhite != botBlack) return botWhite > botBlack
+                      if (botCnt > 0 && topCnt > 0) return (botLumSum / botCnt) >= (topLumSum / topCnt)
+                      return true
+                  } catch (_: Exception) {
+                      return true
+                  }
+              }
+
+              private fun show(msg: String, fromIdx: Int?, toIdx: Int?, sub: String = "") {
+                  var arrow: FloatArray? = null
+                  if (fromIdx != null && toIdx != null && rs > 0) {
+                      val s = rs / boardN.toFloat()
+                      fun pt(idx: Int): PointF {
+                          val file = idx % boardN
+                          val rank = idx / boardN
+                          val col = if (whiteBottom) file else boardN - 1 - file
+                          val row = if (whiteBottom) boardN - 1 - rank else rank
+                          return PointF(rx + (col + 0.5f) * s, ry + (row + 0.5f) * s)
+                      }
+                      val a = pt(fromIdx)
+                      val b = pt(toIdx)
+                      arrow = floatArrayOf(a.x, a.y, b.x, b.y)
+                  }
+                  H.post {
+                      ov?.let {
+                          it.msg = msg; it.sub = sub; it.ar = arrow; it.arrowOn = arrow != null
+                          it.visibility = View.VISIBLE; it.invalidate()
+                      }
+                  }
+              }
+
+              private fun enableManual() {
+                  ov?.let {
+                      it.cal = true
+                      it.msg = "Не нашёл доску. Обведи её по краям"
+                      it.sub = "Потяни от левого верхнего угла к правому нижнему"
+                      it.ar = null
+                      lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      wm.updateViewLayout(it, lp)
+                      it.visibility = View.VISIBLE; it.invalidate()
+                  }
+              }
+
+              private fun readBoardState(): IntArray? = synchronized(lock) {
+                  val img = held ?: return@synchronized null
+                  if (rs < 64) return@synchronized null
+                  try {
+                      val pl = img.planes[0]
+                      val buf = pl.buffer
+                      val st = pl.rowStride
+                      val ps = pl.pixelStride
+                      val bw = img.width
+                      val bh = img.height
+                      val x0 = rx.coerceIn(0, bw - 1)
+                      val y0 = ry.coerceIn(0, bh - 1)
+                      val s = minOf(rs, bw - x0, bh - y0)
+                      val cell = s / boardN.toFloat()
+
+                      val total = boardN * boardN
+                      val ctrLum = FloatArray(total)
+                      val diffCnt = IntArray(total)
+                      val crownDetail = FloatArray(total)
+
+                      for (r in 0 until boardN) {
+                          for (c in 0 until boardN) {
+                              val i = r * boardN + c
+                              val bx = (x0 + (c + 0.12f) * cell).toInt().coerceIn(0, bw - 1)
+                              val by = (y0 + (r + 0.12f) * cell).toInt().coerceIn(0, bh - 1)
+                              val bo = by * st + bx * ps
+                              val br = buf.get(bo).toInt() and 255
+                              val bg = buf.get(bo + 1).toInt() and 255
+                              val bb = buf.get(bo + 2).toInt() and 255
+
+                              var sumL = 0f; var hits = 0
+                              for (dy in -2..2) for (dx in -2..2) {
+                                  val px = (x0 + (c + 0.5f) * cell + dx * (cell * 0.06f)).toInt().coerceIn(0, bw - 1)
+                                  val py = (y0 + (r + 0.5f) * cell + dy * (cell * 0.06f)).toInt().coerceIn(0, bh - 1)
+                                  val po = py * st + px * ps
+                                  val pr = buf.get(po).toInt() and 255
+                                  val pg = buf.get(po + 1).toInt() and 255
+                                  val pb = buf.get(po + 2).toInt() and 255
+                                  sumL += 0.299f * pr + 0.587f * pg + 0.114f * pb
+                                  if (abs(pr - br) + abs(pg - bg) + abs(pb - bb) > 46) hits++
+                              }
+                              ctrLum[i] = sumL / 25f
+                              diffCnt[i] = hits
+
+                              val gN = 7
+                              val lumGrid = FloatArray(gN * gN)
+                              for (gy in 0 until gN) {
+                                  val fy = 0.28f + 0.44f * (gy / (gN - 1f))
+                                  for (gx in 0 until gN) {
+                                      val fx = 0.28f + 0.44f * (gx / (gN - 1f))
+                                      val xx = (x0 + (c + fx) * cell).toInt().coerceIn(0, bw - 1)
+                                      val yy = (y0 + (r + fy) * cell).toInt().coerceIn(0, bh - 1)
+                                      val po = yy * st + xx * ps
+                                      val pr = buf.get(po).toInt() and 255
+                                      val pg = buf.get(po + 1).toInt() and 255
+                                      val pb = buf.get(po + 2).toInt() and 255
+                                      lumGrid[gy * gN + gx] = 0.299f * pr + 0.587f * pg + 0.114f * pb
+                                  }
+                              }
+                              var gradSum = 0f; var gradPairs = 0
+                              for (gy in 0 until gN) for (gx in 0 until gN) {
+                                  val v0 = lumGrid[gy * gN + gx]
+                                  if (gx + 1 < gN) { gradSum += abs(v0 - lumGrid[gy * gN + gx + 1]); gradPairs++ }
+                                  if (gy + 1 < gN) { gradSum += abs(v0 - lumGrid[(gy + 1) * gN + gx]); gradPairs++ }
+                              }
+                              crownDetail[i] = if (gradPairs > 0) gradSum / gradPairs else 0f
+                          }
+                      }
+
+                      val occDetails = ArrayList<Float>()
+                      for (i in 0 until total) if (diffCnt[i] >= 6) occDetails.add(crownDetail[i])
+                      occDetails.sort()
+                      val kingThr = if (occDetails.size >= 4) {
+                          val p75 = occDetails[(occDetails.size * 3) / 4]
+                          val p50 = occDetails[occDetails.size / 2]
+                          max(14f, p50 + (p75 - p50) * 1.15f)
+                      } else {
+                          26f
+                      }
+
+                      val state = IntArray(total)
+                      for (r in 0 until boardN) {
+                          for (c in 0 until boardN) {
+                              val viewIdx = r * boardN + c
+                              if (diffCnt[viewIdx] >= 6) {
+                                  val isWhite = ctrLum[viewIdx] >= 135f
+                                  val isKing = crownDetail[viewIdx] >= kingThr
+                                  val boardIdx = if (whiteBottom) (boardN - 1 - r) * boardN + c else r * boardN + (boardN - 1 - c)
+                                  state[boardIdx] = when {
+                                      isWhite && isKing -> 2
+                                      isWhite -> 1
+                                      isKing -> 4
+                                      else -> 3
+                                  }
+                              }
+                          }
+                      }
+                      state
+                  } catch (_: Exception) { null }
+              }
+
+              private fun matchMove(observed: IntArray): MoveStep? {
+                  val moves = board.legalMoves(mandatoryCapture = true)
+                  var bestMove: MoveStep? = null
+                  var bestScore = Int.MAX_VALUE
+                  for (m in moves) {
+                      val copy = board.copy()
+                      copy.applyMove(m)
+                      var sideDiff = 0
+                      var kingDiff = 0
+                      for (i in observed.indices) {
+                          val exp = copy.cells[i]
+                          val obs = observed[i]
+                          val expSide = when (exp) { 1, 2 -> 1; 3, 4 -> 2; else -> 0 }
+                          val obsSide = when (obs) { 1, 2 -> 1; 3, 4 -> 2; else -> 0 }
+                          if (expSide != obsSide) sideDiff++
+                          if (exp != obs) kingDiff++
+                      }
+                      if (sideDiff == 0) {
+                          if (kingDiff < bestScore) {
+                              bestScore = kingDiff
+                              bestMove = m
+                          }
+                      }
+                  }
+                  return bestMove
+              }
+
+              private fun loop() {
+                  try {
+                      val lib = applicationInfo.nativeLibraryDir + "/libcheckers.so"
+                      val e = CheckersEngine(lib)
+                      eng = e
+                      board.reset()
+
+                      var manual = false
+                      while (running) {
+                          show("Ищу доску…", null, null)
+                          val t0 = System.currentTimeMillis()
+                          var found = false
+                          if (!manual) {
+                              while (running && System.currentTimeMillis() - t0 < 4000) {
+                                  if (autoFindBoard()) { found = true; break }
+                                  Thread.sleep(250)
+                              }
+                          }
+                          if (!found && running) {
+                              regionReady = false
+                              H.post { enableManual() }
+                              while (running && !regionReady && !recalReq) Thread.sleep(200)
+                              manual = false
+                          }
+                          if (!running) return
+
+                          whiteBottom = detectWhiteBottom()
+                          val sideLabel = if (whiteBottom) "белые снизу" else "чёрные снизу"
+                          show("Доска найдена ($sideLabel)", null, null)
+                          Thread.sleep(250)
+
+                          var lastSeq = -1L
+                          var needReSearch = false
+                          while (running && !recalReq && !needReSearch) {
+                              val curSeq = seq
+                              if (curSeq == lastSeq) { Thread.sleep(150); continue }
+                              lastSeq = curSeq
+
+                              val observed = readBoardState() ?: continue
+                              val nonEmpty = observed.count { it != 0 }
+                              if (nonEmpty < 2 || nonEmpty > boardN * boardN) {
+                                  needReSearch = true
+                                  break
+                              }
+
+                              matchMove(observed)?.let { board.applyMove(it) }
+
+                              val sp = getSharedPreferences("s", Context.MODE_PRIVATE)
+                              val both = sp.getBoolean("both", false)
+                              val myWhite = whiteBottom
+                              if (!both && board.whiteTurn != myWhite) {
+                                  show("Жду ход соперника… ($sideLabel)", null, null)
+                                  continue
+                              }
+                              val ms = sp.getInt("ms", 3000).coerceIn(1000, 5000)
+                              val sign = if (board.whiteTurn) 1 else -1
+                              val uci = e.best(board.toFen(), ms, sign)
+                              val step = board.uciToMove(uci, mandatoryCapture = true)
+                              if (step != null) {
+                                  val capNote = if (step.captures.isNotEmpty()) " (взятие: ${step.captures.size})" else ""
+                                  show(
+                                      "${board.coordName(step.from)} → ${board.coordName(step.to)}$capNote",
+                                      step.from, step.to,
+                                      "Оценка: ${e.score} · глубина ${e.depth} · $sideLabel"
+                                  )
+                              } else {
+                                  show("Ход: $uci", null, null, sideLabel)
+                              }
+                          }
+                          if (recalReq) {
+                              recalReq = false
+                              manual = true
+                          }
+                      }
+                  } catch (ex: Exception) {
+                      show("Ошибка: ${ex.message}", null, null)
+                  }
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  ov?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  eng?.quit()
+                  proj?.stop()
+                  synchronized(lock) { try { held?.close() } catch (_: Exception) {}; held = null }
+                  imgThread?.quitSafely()
+                  try { reader?.close() } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk checkers-helper.apk
+          gh release create "v${{ github.run_number }}" checkers-helper.apk --title "APK ${{ github.run_number }}" --notes "Шашечный помощник" --target "${{ github.sha }}"
