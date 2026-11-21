@@ -1469,7 +1469,7 @@ jobs:
                   var b = 0
                   for (i in 0..63) if (cells[i].occ) { if ((i / 8 + i % 8) % 2 == 1) a++ else b++ }
                   if (a + b >= 4) {
-                      if (b > a * 3) mir = true else if (a > b * 3) mir = false
+                      mir = b > a
                   }
               }
 
@@ -1731,6 +1731,7 @@ jobs:
               private fun process(f: IntArray): Int {
                   val cells = cellsInfo(f)
                   val thr = lumThr(cells)
+                  updMirror(cells)
                   val col = colors(cells, thr)
                   var n = 0
                   for (v in col) if (v != 0) n++
