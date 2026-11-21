@@ -854,6 +854,8 @@ jobs:
                           WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
                       PixelFormat.TRANSLUCENT)
                   lp.gravity = Gravity.TOP or Gravity.START
+                  // Android 12+ блокирует нажатия сквозь оверлей, если он непрозрачнее 0.8
+                  lp.alpha = 0.8f
                   if (Build.VERSION.SDK_INT >= 28)
                       lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
                   val o = Overlay(this)
@@ -1004,15 +1006,15 @@ jobs:
                   val s0 = seq
                   hideAll()
                   val t = System.currentTimeMillis()
-                  while (seq == s0 && System.currentTimeMillis() - t < 400) Thread.sleep(10)
-                  Thread.sleep(110)
+                  while (seq == s0 && System.currentTimeMillis() - t < 300) Thread.sleep(5)
+                  Thread.sleep(50)
               }
 
               private fun waitFrame() {
                   val s0 = seq
                   val t = System.currentTimeMillis()
-                  while (seq == s0 && System.currentTimeMillis() - t < 300) Thread.sleep(10)
-                  Thread.sleep(60)
+                  while (seq == s0 && System.currentTimeMillis() - t < 250) Thread.sleep(5)
+                  Thread.sleep(40)
               }
 
               private fun clean(restore: Boolean = true): IntArray? {
@@ -1800,11 +1802,24 @@ jobs:
                   val t0 = System.currentTimeMillis()
                   var manual = false
                   if (forceManual) { manual = true; H.post { enableManual() } }
+                  val sp = getSharedPreferences("s", Context.MODE_PRIVATE)
+                  var saved = if (forceManual) 0 else sp.getInt("rs", 0)
                   while (running && !regionReady) {
                       if (!manual) {
                           freshFrame()
                           val px = fullShot()
                           showAll()
+                          if (px != null && saved > 0) {
+                              // сначала проверяем доску на прошлом месте: это мгновенно
+                              val sx = sp.getInt("rx", 0); val sy = sp.getInt("ry", 0)
+                              saved = 0
+                              if (checkerAdapt(px, fw, fh, sx / SC.toFloat(), sy / SC.toFloat(), sp.getInt("rs", 0) / SC.toFloat() / 8f) >= 44) {
+                                  rx = sx; ry = sy; rs = sp.getInt("rs", 0)
+                                  setBoard()
+                                  regionReady = true
+                                  break
+                              }
+                          }
                           if (px != null) {
                               val r = detectBoard(px, fw, fh)
                               if (r != null) {
@@ -1819,15 +1834,18 @@ jobs:
                               H.post { enableManual() }
                           }
                       }
-                      Thread.sleep(250)
+                      Thread.sleep(100)
                   }
                   return running
+              }
+
+              private fun saveRegion() {
+                  getSharedPreferences("s", Context.MODE_PRIVATE).edit().putInt("rx", rx).putInt("ry", ry).putInt("rs", rs).apply()
               }
 
               // true = нужно заново искать доску
               private fun session(): Boolean {
                   show("Доска найдена. Читаю позицию…", null)
-                  Thread.sleep(150)
                   resetSync()
                   var badSince = 0L
                   var cf: IntArray? = null
@@ -1845,16 +1863,16 @@ jobs:
                       val now = System.currentTimeMillis()
                       if (n > 24 || n < 1) {
                           if (badSince == 0L) badSince = now
-                          if (now - badSince > 2500) return true
+                          if (now - badSince > 1500) return true
                           show("Проверяю границы доски…", null, "шашек: $n")
-                          Thread.sleep(300)
+                          Thread.sleep(100)
                           continue
                       }
                       badSince = 0L
-                      if (establish(cells, thr)) { cf = f; break }
+                      if (establish(cells, thr)) { cf = f; saveRegion(); break }
                       dbg = "шашек: $n, на светлых полях: ${wrongCells(cells)}"
                       if (shiftIdx >= 0) dbg += " · сдвиг " + (shiftIdx + 1)
-                      if (now - failSince > 1800) {
+                      if (now - failSince > 1000) {
                           failSince = now
                           shiftIdx++
                           rx = baseX
@@ -1867,7 +1885,7 @@ jobs:
                           setBoard()
                       }
                       show(noticeMsg(), null, dbg)
-                      Thread.sleep(400)
+                      Thread.sleep(150)
                   }
                   if (!running) return false
                   if (recalReq || cf == null) return true
@@ -1897,7 +1915,7 @@ jobs:
                       val f = (if (needSync) grab() else clean(false)) ?: continue
                       val res = try { process(f) } catch (ex: Exception) { needSync = true; 0 }
                       if (badGrid) {
-                          if (badSince == 0L) badSince = now else if (now - badSince > 2500) return true
+                          if (badSince == 0L) badSince = now else if (now - badSince > 1500) return true
                       } else badSince = 0L
                       if (res == 1 || (wasSync && !needSync)) {
                           st = try { suggest(f) } catch (ex: Exception) { needSync = true; unmatchedSince = 0L; -1 }
